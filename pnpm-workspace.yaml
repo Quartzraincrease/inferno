@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+  - fixtures/*
+  - demo/*
+
+linkWorkspacePackages: true
+sharedWorkspaceLockfile: true
+strictPeerDependencies: false

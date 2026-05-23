@@ -20,24 +20,27 @@ If you think you've found a security vulnerability, please email [Dominic Gannaw
 Repository Layout
 -----------------
 
-The repository structures as a monorepo utilizing [lerna](https://github.com/lerna/lerna) as a management tool of choice. Lerna setup and linking are part of the `postinstall` task so it should be automatically
-run after `npm install`. `lerna` executes command based on a topological-sorted order of packages based on their dependencies.
+The repository is structured as a pnpm workspace. Workspace setup and linking are handled by `pnpm install`, and the root `postinstall` task builds the packages.
 
 For example, if you want to see the order of packages being processed, you can do:
 ```
-$ lerna exec -- node -e "console.log(require('./package.json').name)"
+$ pnpm -r --workspace-concurrency=1 --filter './packages/*' exec node -e "console.log(require('./package.json').name)"
 inferno-shared
 inferno-vnode-flags
+inferno-utils
 inferno
-inferno-hyperscript
+inferno-clone-vnode
 inferno-create-element
 inferno-extras
-inferno-router
+inferno-hyperscript
+inferno-test-utils
+inferno-animation
+inferno-hydrate
+inferno-mobx
+inferno-redux
 inferno-compat
 inferno-server
-inferno-redux
-inferno-mobx
-inferno-test-utils
+inferno-router
 ```
 
 Source files are written in TypeScript and tests are written in JS/JSX consuming the dist files.
@@ -46,16 +49,16 @@ Running tests
 -------------
 Always include tests for the functionality you want to add into Inferno. This way we can avoid regression in future.
 
-Make sure you have lerna tool installed globally.
+Make sure you have pnpm available. The repository pins its pnpm version through `packageManager`, so Corepack can provision it for you:
 
 ```
-npm i -g lerna
+corepack enable
 ```
 
-- Clone the repository, and clean it. `lerna clean`
-- Install development dependencies `npm i`
-- build typescript files `npm run build`
-- run tests `npm run test`
+- Clone the repository.
+- Install development dependencies `pnpm install`
+- build typescript files `pnpm run build`
+- run tests `pnpm run test`
 
 
 Pull requests
@@ -65,7 +68,7 @@ All pull requests are welcome.
 
 *Caveat for what follows: If in doubt, submit the request - a PR that needs tweaking is infinitely more valuable than a request that wasn't made because you were worrying about meeting these requirements.*
 
-Before submitting, run `npm run build` (which will concatenate, lint and test the code) to ensure the build passes - but don't include files from outside the `src` and `test` folders in the PR.
+Before submitting, run `pnpm run build` (which will concatenate, lint and test the code) to ensure the build passes - but don't include files from outside the `src` and `test` folders in the PR.
 
 And make sure the PR haven't been published before!
 
@@ -78,7 +81,7 @@ There isn't (yet) a formal style guide for Inferno, so please take care to adher
 Above all, code should be clean and readable, and commented where necessary. If you add a new feature, make sure you add a test to go along with it!
 
 
-Before you commit your changes, please run `npm run prettier` to format code correctly
+Before you commit your changes, please run `pnpm run prettier` to format code correctly
 
 Small print
 -----------
@@ -87,11 +90,11 @@ There's no contributor license agreement - contributions are made on a common se
 
 Debugging Browser
 -----------------
-Just run `npm run test:browser:debug` Open localhost:9876 and click debug!
+Just run `pnpm run test:browser:debug` Open localhost:9876 and click debug!
 
 Debugging NodeJS
 ----------------
-Its possible to debug inferno tests by running following command `npm run debug` and open chrome web address: chrome://inspect/#devices
+Its possible to debug inferno tests by running following command `pnpm run debug` and open chrome web address: chrome://inspect/#devices
 
 Pro tip: You can filter down number of tests by editing `debug` -task:
 `node --inspect-brk ./node_modules/.bin/jest {*edit this*} --runInBand --no-cache --no-watchman`

@@ -3,9 +3,8 @@
 NOTE: Requires Nodejs >=18 (uses `fetch`)
 
 ```sh
-cd demo/inferno-router-demo
-npm i
-npm run dev
+pnpm install
+pnpm --filter inferno-router-demo run dev:frontend
 ```
 
 Go to http://127.0.0.1:1234/

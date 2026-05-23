@@ -1051,18 +1051,18 @@ If you want to contribute code, fork this project and submit a PR from your fork
 
 ```sh
 $ git clone git@github.com:infernojs/inferno.git
-$ cd inferno && npm i
-$ npm run test:node
-$ npm run build
-$ npm run test:browser
+$ cd inferno && pnpm install
+$ pnpm run test:node
+$ pnpm run build
+$ pnpm run test:browser
 ```
 
 If you only want to run the browser tests when coding, use the following to reduce turnaround by 50-80%:
 
 ```sh
-$ npm run quick-test:browser # Compiles all packages and runs browser tests
-$ npm run quick-test:browser-inferno # Only compiles the inferno package and runs browser tests
-$ npm run quick-test:browser-debug # Compiles all packages and runs browser tests with "debug"
+$ pnpm run quick-test:browser # Compiles all packages and runs browser tests
+$ pnpm run quick-test:browser-inferno # Only compiles the inferno package and runs browser tests
+$ pnpm run quick-test:browser-debug # Compiles all packages and runs browser tests with "debug"
 ```
 
 ## Community
@@ -1097,4 +1097,3 @@ Support this project by becoming a sponsor. Your logo will show up here with a l
 <a href="https://opencollective.com/inferno/sponsor/7/website" target="_blank"><img src="https://opencollective.com/inferno/sponsor/7/avatar.svg"></a>
 <a href="https://opencollective.com/inferno/sponsor/8/website" target="_blank"><img src="https://opencollective.com/inferno/sponsor/8/avatar.svg"></a>
 <a href="https://opencollective.com/inferno/sponsor/9/website" target="_blank"><img src="https://opencollective.com/inferno/sponsor/9/avatar.svg"></a>
-

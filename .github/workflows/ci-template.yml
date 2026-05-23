@@ -16,24 +16,27 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: latest
-          
+
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Lint
-        run: npm run lint
+        run: pnpm run lint
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       - name: Test with coverage
-        run: npm run test:coverage
+        run: pnpm run test:coverage
 
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@v2
 
       - name: Run browser tests on SauceLabs
-        run: npm run test:browser:sauce
+        run: pnpm run test:browser:sauce
         env:
           SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
           SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}

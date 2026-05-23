@@ -1,5 +1,6 @@
 {
   "name": "inferno-router-demo",
+  "private": true,
   "version": "8.0.5",
   "description": "Influence CMS Demo",
   "author": "Sebastian Ware <sebastian@urbantalk.se> (https://github.com/jhsware)",
@@ -11,12 +12,12 @@
     "dev:backend": "cross-env FORCE_COLOR=1 ts-node-dev --respawn src/server.ts"
   },
   "dependencies": {
-    "inferno": "file:../../packages/inferno",
-    "inferno-animation": "file:../../packages/inferno-animation",
-    "inferno-create-element": "file:../../packages/inferno-create-element",
-    "inferno-hydrate": "file:../../packages/inferno-hydrate",
-    "inferno-router": "file:../../packages/inferno-router",
-    "inferno-server": "file:../../packages/inferno-server",
+    "inferno": "workspace:*",
+    "inferno-animation": "workspace:*",
+    "inferno-create-element": "workspace:*",
+    "inferno-hydrate": "workspace:*",
+    "inferno-router": "workspace:*",
+    "inferno-server": "workspace:*",
     "koa": "^2.15.3",
     "koa-json-body": "^5.3.0",
     "koa-logger": "^3.2.1",
