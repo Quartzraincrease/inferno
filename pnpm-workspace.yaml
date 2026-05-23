@@ -7,6 +7,10 @@ linkWorkspacePackages: true
 sharedWorkspaceLockfile: true
 strictPeerDependencies: false
 
+overrides:
+  webdriver: 9.27.0
+  webdriverio: 9.27.0
+
 allowBuilds:
   '@parcel/watcher@2.5.6': true
   '@swc/core@1.15.24': true

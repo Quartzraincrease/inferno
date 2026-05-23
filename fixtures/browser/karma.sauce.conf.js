@@ -1,48 +1,58 @@
 const path = require('path');
 const gzipPreprocessor = require('./gzip/gzippreprocessor');
 const resolve = (pkg) => path.join(__dirname, '../../packages', pkg, 'dist', 'index.dev.mjs');
+const webdriverClassic = {
+  'wdio:enforceWebDriverClassic': true
+};
 
 const customLaunchers = {
   slChrome: {
     base: 'SauceLabs',
     browserName: 'chrome',
     browserVersion: 'latest',
-    platform: 'Windows 11'
+    platform: 'Windows 11',
+    ...webdriverClassic
   },
   slSafari14: {
     base: 'SauceLabs',
     browserName: 'safari',
     browserVersion: '16',
-    platform: 'macOS 12'
+    platform: 'macOS 12',
+    ...webdriverClassic
   },
   slSafari15: {
     base: 'SauceLabs',
     browserName: 'safari',
     browserVersion: 'latest',
-    platform: 'macOS 13'
+    platform: 'macOS 13',
+    ...webdriverClassic
   },
   slEdge: {
     base: 'SauceLabs',
     browserName: 'MicrosoftEdge',
     browserVersion: 'latest',
-    platform: 'Windows 11'
+    platform: 'Windows 11',
+    ...webdriverClassic
   },
   sl_mac_chrome: {
     base: 'SauceLabs',
     browserName: 'chrome',
     browserVersion: 'latest',
-    platform: 'macOS 12'
+    platform: 'macOS 12',
+    ...webdriverClassic
   },
   slFirefox: {
     base: 'SauceLabs',
     browserName: 'firefox',
-    browserVersion: 'latest'
+    browserVersion: 'latest',
+    ...webdriverClassic
   },
   slFirefox119: {
     base: 'SauceLabs',
     browserName: 'firefox',
     browserVersion: '119',
     platform: 'Linux',
+    ...webdriverClassic,
     'sauce:options': {
       geckodriverVersion: '0.33.0'
     }
