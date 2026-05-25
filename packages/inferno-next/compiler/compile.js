@@ -140,11 +140,10 @@ function compileFunctionBody(node, ctx, name) {
   const params = node.params.map(p => printNode(p)).join(', ');
   const paramsClause = params ? `, ${params}` : '';
 
-  // Early-return desugaring: `if (cond) return;` short-circuits the rest of
-  // the body. We rewrite this into `if (!cond) { ...rest }` so all subsequent
-  // JSX is gated by the inverted condition. Our Symbol-keyed hooks make it
-  // safe for hooks to appear after early returns (call-order independence).
-  const bodyRewritten = rewriteEarlyReturns(node.body);
+  // Early-exit desugaring: `if (cond) return;` (component body) and
+  // `if (cond) continue;` (for-of body) both short-circuit the rest. We
+  // rewrite to `if (!cond) { ...rest }` so subsequent JSX is gated.
+  const bodyRewritten = rewriteEarlyExits(node.body);
 
   // Split body: statement nodes vs JSX-position nodes.
   const statements = [];
@@ -957,36 +956,45 @@ function makeForCall(node, ctx, componentName, inlinedSubs) {
 // ===========================================================================
 
 /**
- * Detect `if (cond) return;` (with or without braces). These are short-circuit
- * guards that short-circuit the body from this point on.
+ * Detect short-circuit guards: `if (cond) return;` (at component-body level)
+ * AND `if (cond) continue;` (inside a for-of body). Both have identical
+ * compile-time semantics: "skip everything after this point" — for a component
+ * body that means render nothing more; for a for-of item that means render
+ * nothing more for THIS item but the next item still iterates.
+ *
+ * Accepts both no-braces (`if (x) continue;`) and single-statement-block
+ * (`if (x) { continue; }`). Rejects forms with an alternate or a value-return.
  */
-function isEarlyReturnIf(stmt) {
+function isEarlyExitIf(stmt) {
   if (!stmt || stmt.type !== 'IfStatement' || stmt.alternate) return false;
   const c = stmt.consequent;
-  if (c.type === 'ReturnStatement' && c.argument == null) return true;
-  if (c.type === 'BlockStatement'
-    && c.body.length === 1
-    && c.body[0].type === 'ReturnStatement'
-    && c.body[0].argument == null) return true;
+  if (isEarlyExitStatement(c)) return true;
+  if (c.type === 'BlockStatement' && c.body.length === 1 && isEarlyExitStatement(c.body[0])) return true;
+  return false;
+}
+
+function isEarlyExitStatement(s) {
+  if (!s) return false;
+  if (s.type === 'ReturnStatement' && s.argument == null) return true;
+  if (s.type === 'ContinueStatement' && s.label == null) return true;
   return false;
 }
 
 /**
- * Rewrite TSRX early-returns into nested negated-condition if-blocks:
- *   stmt1; if (X) return; stmt2; if (Y) return; stmt3;
+ * Rewrite early-exit guards into nested negated-condition if-blocks:
+ *   stmt1; if (X) continue; stmt2; if (Y) return; stmt3;
  *   ⇒
  *   stmt1; if (!X) { stmt2; if (!Y) { stmt3; } }
  *
- * The result is then processed by our existing if-as-jsx machinery — each
- * synthetic `if (!cond) { ... }` becomes an ifBlock if its body contains JSX.
+ * Each synthetic `if (!cond) { ... }` becomes an ifBlock at compile time.
+ * Symbol-keyed hooks make it safe to declare hooks after an early exit.
  */
-function rewriteEarlyReturns(body) {
+function rewriteEarlyExits(body) {
   const out = [];
   for (let i = 0; i < body.length; i++) {
     const stmt = body[i];
-    if (isEarlyReturnIf(stmt)) {
-      const rest = rewriteEarlyReturns(body.slice(i + 1));
-      // If `rest` is empty, the early-return becomes a no-op (nothing after it).
+    if (isEarlyExitIf(stmt)) {
+      const rest = rewriteEarlyExits(body.slice(i + 1));
       if (rest.length > 0) {
         out.push({
           type: 'IfStatement',
