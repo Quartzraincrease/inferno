@@ -640,11 +640,23 @@ export function useId(slot: symbol): string {
 // Templates: parse-once HTML → clone-per-instance
 // ---------------------------------------------------------------------------
 
-export function template(html: string): Element {
+// Namespace flag: 0 = HTML, 1 = SVG, 2 = MathML. The compiler picks the
+// constant; we never look at namespaceURI at runtime.
+export function template(html: string, ns: number = 0, frag: number = 0): Element {
   const t = document.createElement('template');
-  t.innerHTML = html;
-  // Cast: caller knows their template produces an Element root.
-  return (t.content.firstChild as Element);
+  if (ns === 0) {
+    t.innerHTML = html;
+    return t.content.firstChild as Element;
+  }
+  // Wrap in <svg>/<math> so the HTML5 parser places descendants in the right
+  // foreign-content namespace (Svelte/Ripple's trick — also works around
+  // happy-dom which doesn't enter MathML foreign-content mode from a bare
+  // <math> root). For multi-root templates (frag=1) return the wrapper itself
+  // so the caller can drain its children.
+  const wrap = ns === 1 ? 'svg' : 'math';
+  t.innerHTML = `<${wrap}>${html}</${wrap}>`;
+  const wrapEl = t.content.firstChild as Element;
+  return frag ? wrapEl : (wrapEl.firstChild as Element);
 }
 
 export function clone<T extends Node>(node: T): T {
@@ -667,8 +679,79 @@ export function setAttribute(el: Element, name: string, value: any): void {
 }
 
 export function setClassName(el: Element, value: string | null | undefined): void {
-  // className property is the fastest path on HTMLElement.
+  // Fast path on HTMLElement. For SVG/MathML hosts the compiler emits
+  // setAttribute(el, 'class', ...) directly — never routes here — because
+  // SVGElement.className is a read-only SVGAnimatedString and assignment
+  // is a no-op in real browsers.
   (el as any).className = value == null ? '' : value;
+}
+
+// ---------------------------------------------------------------------------
+// Style — kebab-case object form (Inferno semantics) or full cssText string.
+// `prev` is the previous value tracked by the compiler so we can diff
+// object→object and only touch the properties that changed.
+// ---------------------------------------------------------------------------
+
+const IMPORTANT_RE = /\s*!important\s*$/;
+
+export function setStyle(el: HTMLElement | SVGElement, value: any, prev: any): void {
+  const style = (el as HTMLElement).style;
+
+  if (value == null || value === false || value === '') {
+    if (prev != null && prev !== false && prev !== '') style.cssText = '';
+    return;
+  }
+
+  if (typeof value === 'string') {
+    if (prev !== value) style.cssText = value;
+    return;
+  }
+
+  // Object form. If prev is an object too, diff per-property — only changed
+  // keys are touched. Otherwise (prev was string / null) reset cssText first
+  // so leftover declarations don't leak across the transition.
+  if (prev && typeof prev === 'object') {
+    for (const k in prev) {
+      if (!(k in value)) style.removeProperty(k);
+    }
+    for (const k in value) {
+      const v = value[k];
+      if (v === prev[k]) continue;
+      if (v == null || v === false) style.removeProperty(k);
+      else applyStyleProperty(style, k, v);
+    }
+  } else {
+    if (typeof prev === 'string') style.cssText = '';
+    for (const k in value) {
+      const v = value[k];
+      if (v != null && v !== false) applyStyleProperty(style, k, v);
+    }
+  }
+}
+
+function applyStyleProperty(style: CSSStyleDeclaration, name: string, value: any): void {
+  const s = typeof value === 'number' ? String(value) : (value as string);
+  if (IMPORTANT_RE.test(s)) {
+    style.setProperty(name, s.replace(IMPORTANT_RE, ''), 'important');
+  } else {
+    style.setProperty(name, s);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Component-scoped <style> injection — idempotent, keyed by the compiled
+// stylesheet hash so repeated mounts (or HMR re-imports) inject once.
+// ---------------------------------------------------------------------------
+
+const _injectedStyles = new Set<string>();
+
+export function injectStyle(id: string, css: string): void {
+  if (_injectedStyles.has(id)) return;
+  _injectedStyles.add(id);
+  const el = document.createElement('style');
+  el.setAttribute('data-inferno-next', id);
+  el.textContent = css;
+  document.head.appendChild(el);
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,8 @@ export {
   setText,
   setAttribute,
   setClassName,
+  setStyle,
+  injectStyle,
   delegateEvents,
   forBlock,
   ifBlock,
