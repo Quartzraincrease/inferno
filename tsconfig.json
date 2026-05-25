@@ -4,6 +4,9 @@
       "inferno": [
         "./packages/inferno/src/index.ts"
       ],
+      "inferno-next": [
+        "./packages/inferno-next/src/index.ts"
+      ],
       "inferno-compat": [
         "./packages/inferno-compat/src/index.ts"
       ],

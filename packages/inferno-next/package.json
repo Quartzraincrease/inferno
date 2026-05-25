@@ -1,0 +1,38 @@
+{
+  "name": "inferno-next",
+  "private": true,
+  "version": "0.1.0-alpha.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Template-clone renderer with React-shape state model — experimental successor to Inferno's VDOM",
+  "author": {
+    "name": "Dominic Gannaway",
+    "email": "dg@domgan.com"
+  },
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src",
+    "compiler",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./compiler": "./compiler/index.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@tsrx/core": "^0.1.13",
+    "esrap": "^2.2.9",
+    "is-reference": "^3.0.3",
+    "zimmerframe": "^1.1.4"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.9.0",
+    "vitest": "^4.1.7"
+  }
+}
