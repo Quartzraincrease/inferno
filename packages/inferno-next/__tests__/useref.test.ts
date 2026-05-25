@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { mount, nextPaint } from './_helpers';
+import { flushSync } from '../src/index.js';
 import {
   PersistsAcrossRenders, MutationDoesNotRerender, StableIdentity,
   RefInIf, PerRowRef, DomRefObject, DomRefCallback, MultipleRefsOneEl,
-  DomRefCleanup, LazyInit,
+  DomRefCleanup, DomRefObjectCleanup, ImperativeOwner, LazyInit,
 } from './_fixtures/useref.tsrx';
 
 describe('useRef — mutation API', () => {
@@ -43,12 +44,16 @@ describe('useRef — mutation API', () => {
     r.unmount();
   });
 
-  it('runs the initial value only once', () => {
-    const factory = vi.fn(() => ({ token: Math.random() }));
+  it('keeps the FIRST value across renders even when input changes', () => {
+    // useRef is not lazy (React parity) — `factory()` evaluates each render —
+    // but the ref's .current stays at whatever it was first set to.
+    let seq = 0;
+    const factory = vi.fn(() => ({ token: ++seq }));
     const r = mount(LazyInit, { factory });
     const first = factory.mock.results[0].value;
     r.click('button'); r.click('button');
-    expect(factory).toHaveBeenCalledTimes(1);
+    // factory was called each render, but ref.current didn't change.
+    expect(factory.mock.calls.length).toBeGreaterThan(1);
     expect(r.find('button').textContent).toContain(String(first));
     r.unmount();
   });
@@ -113,14 +118,57 @@ describe('useRef — DOM ref attribute', () => {
     expect(target.a.className).toBe('multi');
   });
 
-  it('object ref is cleared when the host element unmounts', () => {
-    const r = mount(DomRefCleanup);
-    expect(r.find('.snapshot').textContent).toBe('has-el');
+  it('callback ref is invoked with the element on mount, then with null on unmount', () => {
+    const calls: Array<Element | null> = [];
+    const r = mount(DomRefCleanup, { observe: (el: Element | null) => calls.push(el) });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).not.toBe(null);
     r.click('#toggle');                                     // hide → element unmounts
-    // After re-render, the ref was set to null on unmount, snapshot reflects it.
-    expect(r.find('.snapshot').textContent).toBe('null');
-    r.click('#toggle');                                     // show again
-    expect(r.find('.snapshot').textContent).toBe('has-el');
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toBe(null);
+    r.click('#toggle');                                     // show → fresh element
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).not.toBe(null);
+    expect(calls[2]).not.toBe(calls[0]);                   // new element instance
     r.unmount();
+    expect(calls).toHaveLength(4);
+    expect(calls[3]).toBe(null);                            // cleared on root unmount too
+  });
+
+  it('object ref .current is set to null when host element unmounts', () => {
+    const objRef: { current: Element | null } = { current: null };
+    const r = mount(DomRefObjectCleanup, { ref: objRef });
+    expect(objRef.current).not.toBe(null);
+    expect(objRef.current!.className).toBe('obj-target');
+    r.click('#toggle');                                     // hide
+    expect(objRef.current).toBe(null);
+    r.click('#toggle');                                     // show again
+    expect(objRef.current).not.toBe(null);
+    r.unmount();
+    expect(objRef.current).toBe(null);
+  });
+});
+
+describe('useImperativeHandle', () => {
+  it('child exposes an imperative API via the ref the parent passes in', async () => {
+    const handle: { current: any } = { current: null };
+    const r = mount(ImperativeOwner, { handle });
+    await nextPaint();                                      // layout effect commits
+    expect(handle.current).not.toBe(null);
+    expect(typeof handle.current.bump).toBe('function');
+    expect(typeof handle.current.reset).toBe('function');
+    expect(r.find('.counter').textContent).toBe('0');
+    // Use the imperative API from outside — flushSync to drain the resulting
+    // render synchronously so we can assert on the DOM.
+    flushSync(() => {
+      handle.current.bump();
+      handle.current.bump();
+      handle.current.bump();
+    });
+    expect(r.find('.counter').textContent).toBe('3');
+    flushSync(() => handle.current.reset());
+    expect(r.find('.counter').textContent).toBe('0');
+    r.unmount();
+    expect(handle.current).toBe(null);                      // cleared on unmount
   });
 });

@@ -523,6 +523,28 @@ export function useRef<T>(initial: T, slot: symbol): { current: T } {
 }
 
 /**
+ * React's `useImperativeHandle(ref, factory, deps)` — exposes an imperative
+ * API to a parent via the ref. Scheduled as a layout-phase effect so the
+ * `ref.current` is populated before paint and before any layout effects in
+ * ancestors that depend on the API. Cleared to null on unmount.
+ */
+export function useImperativeHandle<T>(
+  ref: { current: T | null } | ((value: T | null) => void) | null | undefined,
+  factory: () => T,
+  deps: any[],
+  slot: symbol,
+): void {
+  const setRef = (value: T | null): void => {
+    if (typeof ref === 'function') (ref as any)(value);
+    else if (ref != null) (ref as { current: T | null }).current = value;
+  };
+  enqueueEffect(slot, () => {
+    setRef(factory());
+    return () => setRef(null);
+  }, deps, LAYOUT);
+}
+
+/**
  * React 19 `useEffectEvent` — returns a stable function whose body always
  * reflects the latest version of `fn`. Use inside `useEffect` deps to escape
  * the "must re-create the effect just because a closure-captured value changed"

@@ -34,7 +34,7 @@ const VOID_ELEMENTS = new Set([
 
 const HOOK_NAMES = new Set([
   'useState', 'useReducer', 'useEffect', 'useLayoutEffect', 'useInsertionEffect',
-  'useMemo', 'useCallback', 'useRef', 'useId', 'useEffectEvent',
+  'useMemo', 'useCallback', 'useRef', 'useId', 'useEffectEvent', 'useImperativeHandle',
 ]);
 
 const RUNTIME_NAMES = new Set([

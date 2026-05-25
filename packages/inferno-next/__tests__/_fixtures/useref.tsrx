@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'inferno-next';
+import { useState, useRef, useEffect, useImperativeHandle } from 'inferno-next';
 
 // Initial value only runs once — mutations persist across re-renders without
 // re-triggering them.
@@ -97,23 +97,57 @@ export component MultipleRefsOneEl(props) {
   </div>
 }
 
-// `{ref refObj}` cleared on unmount (object form sets `.current` back to null).
-export component DomRefCleanup() {
+// Cleanup on unmount: a callback ref observes mount + unmount.
+// Each invocation of the callback updates `lastEl`, which a render-prop
+// snapshot test can observe (it sees mount → unmount → mount-again).
+export component DomRefCleanup(props) {
   const [show, setShow] = useState(true);
-  const ref = useRef(null);
   <div>
     <button id='toggle' onClick={() => setShow(!show)}>{text 'toggle'}</button>
-    <span class='snapshot'>{text ref.current == null ? 'null' : 'has-el'}</span>
     if (show) {
       <div class='target'>
-        {ref ref}
+        {ref (el) => props.observe(el)}
         {text 'live'}
       </div>
     }
   </div>
 }
 
-// Lazy initial value is computed exactly once.
+// Object ref cleanup — the ref's `.current` is set to null on unmount.
+export component DomRefObjectCleanup(props) {
+  const [show, setShow] = useState(true);
+  <div>
+    <button id='toggle' onClick={() => setShow(!show)}>{text 'toggle'}</button>
+    if (show) {
+      <div class='obj-target'>
+        {ref props.ref}
+        {text 'live'}
+      </div>
+    }
+  </div>
+}
+
+// useImperativeHandle: child exposes an imperative API via a ref the parent owns.
+// Use functional setters so external callers can accumulate across rapid calls
+// without depending on a fresh render between them.
+component Counter(props) {
+  const [n, setN] = useState(0);
+  useImperativeHandle(props.api, () => ({
+    bump: () => setN((c) => c + 1),
+    reset: () => setN(0),
+  }), [props.api]);
+  <span class='counter'>{text n}</span>
+}
+
+export component ImperativeOwner(props) {
+  <div>
+    <Counter api={props.handle} />
+  </div>
+}
+
+// Initial value persists across renders — even though `props.factory()` is
+// evaluated each render (useRef is NOT lazy in React's API, only useState is),
+// the ref keeps the FIRST value it received and ignores later inputs.
 export component LazyInit(props) {
   const ref = useRef(props.factory());
   const [tick, setTick] = useState(0);

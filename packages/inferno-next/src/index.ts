@@ -17,6 +17,7 @@ export {
   useCallback,
   useRef,
   useId,
+  useImperativeHandle,
   useEffectEvent,
 
   // Context
