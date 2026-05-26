@@ -1692,6 +1692,7 @@ export function forBlock<T, E = undefined>(
   getKey: (item: T, index: number) => any,
   itemBody: (scope: Scope, item: T, extra: E) => void,
   extra?: E,
+  pure?: number,
 ): void {
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as ForSlot | undefined;
@@ -1703,7 +1704,7 @@ export function forBlock<T, E = undefined>(
     state = { __kind: 'forBlockSlot', start, end, items: new Map(), order: [], hasCleanups: false };
     parentScope[slotKey] = state;
   }
-  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra);
+  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra, !!pure);
 }
 
 function reconcileKeyed<T, E>(
@@ -1713,6 +1714,7 @@ function reconcileKeyed<T, E>(
   getKey: (item: T, index: number) => any,
   itemBody: (scope: Scope, item: T, extra: E) => void,
   extra: E,
+  pure: boolean,
 ): void {
   const oldOrder = state.order;
   const oldItems = state.items;
@@ -1750,11 +1752,22 @@ function reconcileKeyed<T, E>(
     if (oldKey !== newKey) break;
     // Same key, same position — re-render in place.
     const block = oldItems.get(oldKey)!;
-    block.props = items[prefixLen];
-    block.extra = extra;
-    block.body = itemBody as ComponentBody;
-    block.itemIndex = prefixLen;
-    renderBlock(block);
+    const newItem = items[prefixLen];
+    // Pure-body memo: when the compiler statically proved this for-of body
+    // closes over nothing from parent scope, the body's output is a pure
+    // function of (item, itemIndex). If both are identity-unchanged we can
+    // skip renderBlock entirely — the DOM is already correct.
+    if (pure && block.props === newItem && block.itemIndex === prefixLen) {
+      // still keep extra + body fresh in case the parent re-bound them
+      block.extra = extra;
+      block.body = itemBody as ComponentBody;
+    } else {
+      block.props = newItem;
+      block.extra = extra;
+      block.body = itemBody as ComponentBody;
+      block.itemIndex = prefixLen;
+      renderBlock(block);
+    }
     prefixLen++;
   }
 
@@ -1771,11 +1784,17 @@ function reconcileKeyed<T, E>(
     const newKey = getKey(items[newEnd], newEnd);
     if (oldKey !== newKey) break;
     const block = oldItems.get(oldKey)!;
-    block.props = items[newEnd];
-    block.extra = extra;
-    block.body = itemBody as ComponentBody;
-    block.itemIndex = newEnd;
-    renderBlock(block);
+    const newItem = items[newEnd];
+    if (pure && block.props === newItem && block.itemIndex === newEnd) {
+      block.extra = extra;
+      block.body = itemBody as ComponentBody;
+    } else {
+      block.props = newItem;
+      block.extra = extra;
+      block.body = itemBody as ComponentBody;
+      block.itemIndex = newEnd;
+      renderBlock(block);
+    }
     oldEnd--;
     newEnd--;
   }
@@ -1874,11 +1893,21 @@ function reconcileKeyed<T, E>(
       else lastIdx = newIdx;
       patched++;
       const block = oldItems.get(oldKey)!;
-      block.props = items[newIdx];
-      block.extra = extra;
-      block.body = itemBody as ComponentBody;
-      block.itemIndex = newIdx;
-      renderBlock(block);
+      const newItem = items[newIdx];
+      // Pure-body memo (same as prefix/suffix paths) — most middle survivors
+      // in a typical reorder (swap, etc.) hit this fast path: item ref and
+      // position unchanged, so the body's output is provably identical and
+      // we skip the renderBlock call entirely.
+      if (pure && block.props === newItem && block.itemIndex === newIdx) {
+        block.extra = extra;
+        block.body = itemBody as ComponentBody;
+      } else {
+        block.props = newItem;
+        block.extra = extra;
+        block.body = itemBody as ComponentBody;
+        block.itemIndex = newIdx;
+        renderBlock(block);
+      }
     }
   }
 

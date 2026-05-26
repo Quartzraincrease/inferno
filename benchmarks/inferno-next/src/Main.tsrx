@@ -54,7 +54,7 @@ export default component Main() {
     return out;
   });
 
-  <div>
+  <div id="main" class="container">
     <div class='jumbotron'>
       <div class='row'>
         <div class='col-md-6'><h1>{'inferno-next'}</h1></div>

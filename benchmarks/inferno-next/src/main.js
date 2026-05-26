@@ -1,7 +1,8 @@
-import { createRoot, flushSync, delegateEvents } from 'inferno-next';
+import { createRoot, flushSync } from 'inferno-next';
 import Main from './Main.tsrx';
 
-delegateEvents(['click']);
+// `delegateEvents([...])` is auto-emitted by the compiler at the top of every
+// .tsrx module that uses delegated events — no manual registration needed.
 
 const container = document.getElementById('main');
 const root = createRoot(container);

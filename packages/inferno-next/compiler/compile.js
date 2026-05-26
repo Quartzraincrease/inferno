@@ -103,6 +103,178 @@ function staticObjectToCssString(obj) {
   return parts.join('; ');
 }
 
+// ===========================================================================
+// Purity analysis — for-of body memoisation
+// ===========================================================================
+
+/**
+ * Collect names bound by a destructuring pattern into `out`. Handles
+ * Identifier / ObjectPattern / ArrayPattern / RestElement / AssignmentPattern.
+ */
+function collectBindings(pattern, out) {
+  if (!pattern) return;
+  if (pattern.type === 'Identifier') { out.add(pattern.name); return; }
+  if (pattern.type === 'ObjectPattern') {
+    for (const p of pattern.properties || []) {
+      if (p.type === 'RestElement') collectBindings(p.argument, out);
+      else collectBindings(p.value || p.key, out);
+    }
+    return;
+  }
+  if (pattern.type === 'ArrayPattern') {
+    for (const e of pattern.elements || []) collectBindings(e, out);
+    return;
+  }
+  if (pattern.type === 'RestElement') { collectBindings(pattern.argument, out); return; }
+  if (pattern.type === 'AssignmentPattern') { collectBindings(pattern.left, out); return; }
+}
+
+/**
+ * Names directly declared at the outer component body — params + top-level
+ * `const`/`let`/`var` + `function` declarations. We DON'T recurse into nested
+ * blocks (those are scoped lower). Used as the "did the for-of body reference
+ * anything from parent scope?" oracle for memoisation.
+ */
+function collectComponentLocals(componentNode) {
+  const locals = new Set();
+  for (const p of componentNode.params || []) collectBindings(p, locals);
+  for (const stmt of componentNode.body || []) {
+    if (stmt.type === 'VariableDeclaration') {
+      for (const d of stmt.declarations || []) collectBindings(d.id, locals);
+    } else if (stmt.type === 'FunctionDeclaration') {
+      if (stmt.id) locals.add(stmt.id.name);
+    }
+  }
+  return locals;
+}
+
+/**
+ * Walk an AST subtree collecting Identifier references that are NOT bound
+ * locally (inside the subtree). Tracks block/function scopes so inner `const`
+ * declarations correctly shadow outer references.
+ */
+function collectFreeIdentifiers(root, initiallyBound) {
+  const free = new Set();
+  walk(root, new Set(initiallyBound));
+  return free;
+
+  function walk(n, scope) {
+    if (!n) return;
+    if (Array.isArray(n)) { for (const x of n) walk(x, scope); return; }
+    if (typeof n !== 'object') return;
+
+    const t = n.type;
+    if (!t) return;
+
+    if (t === 'Identifier') {
+      if (!scope.has(n.name)) free.add(n.name);
+      return;
+    }
+
+    // Member access — `obj.prop`: prop is a static name, not a binding ref.
+    if (t === 'MemberExpression' && !n.computed) {
+      walk(n.object, scope);
+      return;
+    }
+    // Object literal property keys are static names (when not computed).
+    if (t === 'Property' && !n.computed) {
+      walk(n.value, scope);
+      return;
+    }
+
+    // Function-like scopes — params introduce new bindings.
+    if (t === 'FunctionExpression' || t === 'FunctionDeclaration' || t === 'ArrowFunctionExpression') {
+      const newScope = new Set(scope);
+      for (const p of n.params || []) collectBindings(p, newScope);
+      // `function name(){}` introduces its own name into the body scope too.
+      if (n.id) collectBindings(n.id, newScope);
+      walk(n.body, newScope);
+      return;
+    }
+
+    // Block scope — hoist `var`/`function` + pre-collect `let`/`const` so
+    // forward references work the same way they do at runtime.
+    if (t === 'BlockStatement') {
+      const newScope = new Set(scope);
+      for (const stmt of n.body || []) {
+        if (stmt.type === 'VariableDeclaration') {
+          for (const d of stmt.declarations || []) collectBindings(d.id, newScope);
+        } else if (stmt.type === 'FunctionDeclaration' && stmt.id) {
+          newScope.add(stmt.id.name);
+        }
+      }
+      walk(n.body, newScope);
+      return;
+    }
+
+    // VariableDeclarator's `id` is a binding, only walk the init.
+    if (t === 'VariableDeclarator') { walk(n.init, scope); return; }
+
+    // CatchClause introduces its param.
+    if (t === 'CatchClause') {
+      const newScope = new Set(scope);
+      if (n.param) collectBindings(n.param, newScope);
+      walk(n.body, newScope);
+      return;
+    }
+
+    // for / for-in / for-of — left declarator introduces bindings.
+    if (t === 'ForStatement' || t === 'ForInStatement' || t === 'ForOfStatement') {
+      const newScope = new Set(scope);
+      if (n.left && n.left.type === 'VariableDeclaration') {
+        for (const d of n.left.declarations || []) collectBindings(d.id, newScope);
+      } else if (n.left) {
+        collectBindings(n.left, newScope);
+      }
+      walk(n.init, newScope);
+      walk(n.test, newScope);
+      walk(n.update, newScope);
+      walk(n.right, newScope);
+      walk(n.body, newScope);
+      return;
+    }
+
+    // Default: walk all child fields.
+    for (const key in n) {
+      if (key === 'type' || key === 'loc' || key === 'start' || key === 'end' || key === 'range' || key === 'metadata') continue;
+      walk(n[key], scope);
+    }
+  }
+}
+
+/**
+ * `() => fn(a, b, …)` — a zero-param arrow whose body is a single
+ * function call. Returns `{ callee, args }` if so, else null. Used to compile
+ * event handlers to the runtime's `{ fn, args }` bundle form so the
+ * dispatcher gets a stable callee + identity-diffable args, sidestepping a
+ * per-render closure allocation on keyed-list survivors.
+ *
+ * Conservative: we ONLY match arrows with NO params (so the user definitely
+ * isn't reading the event arg), and the body must be a single CallExpression
+ * (no statements, no side effects beyond the call). Members/index expressions
+ * as the callee are fine — JS will resolve `this` correctly when the bundle
+ * is invoked because the dispatcher uses `slot.fn.apply(null, ...)` only for
+ * the variadic case; small-arity calls invoke the fn directly.
+ */
+function detectStableEventBundle(node) {
+  if (!node || node.type !== 'ArrowFunctionExpression') return null;
+  if (node.params.length !== 0) return null;
+  // The body may be a BlockStatement with a single `return call()` or just
+  // the expression directly (concise-arrow form).
+  let body = node.body;
+  if (body && body.type === 'BlockStatement') {
+    if (body.body.length !== 1) return null;
+    const stmt = body.body[0];
+    if (stmt.type === 'ExpressionStatement') body = stmt.expression;
+    else if (stmt.type === 'ReturnStatement' && stmt.argument) body = stmt.argument;
+    else return null;
+  }
+  if (!body || body.type !== 'CallExpression') return null;
+  // Bail if any arg is a spread — bundle args are positional only.
+  if (body.arguments.some((a) => a.type === 'SpreadElement')) return null;
+  return { callee: body.callee, args: body.arguments };
+}
+
 function isJsxLike(node) {
   if (!node) return false;
   const t = node.type;
@@ -200,6 +372,7 @@ export function compile(source, filename) {
     hoistedHelpers: [],   // raw JS strings (sub-components, hook Symbols, key fns)
     delegatedEvents: new Set(),  // event names seen in JSX — auto-emits delegateEvents(...)
     cssInjections: [],    // { hash, css } — one entry per component with a <style> block
+    currentComponentLocals: null,  // Set<string> while compiling a component body; null otherwise
     nextHookSymId: 0,
     nextTemplateId: 0,
     nextHelperId: 0,
@@ -284,7 +457,19 @@ function compileComponent(node, ctx) {
     ctx.runtimeNeeded.add('injectStyle');
   }
 
-  const fn = compileFunctionBody(node, ctx, name, 'html', cssHash);
+  // Snapshot the component's outer locals so nested for-of bodies can do
+  // purity analysis (and auto-memo when the body doesn't reference any of
+  // them). Stash on ctx for the duration of this compile so nested makeForCall
+  // can reach it; restore on exit so sibling components don't see this one's
+  // locals.
+  const prevLocals = ctx.currentComponentLocals;
+  ctx.currentComponentLocals = collectComponentLocals(node);
+  let fn;
+  try {
+    fn = compileFunctionBody(node, ctx, name, 'html', cssHash);
+  } finally {
+    ctx.currentComponentLocals = prevLocals;
+  }
 
   if (isDefault) {
     return `const ${name} = ${fn};\nexport default ${name};`;
@@ -592,7 +777,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   const afterLines = [];
   for (const fc of forCalls) {
     ctx.runtimeNeeded.add('forBlock');
-    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr});`);
+    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr}${fc.pure ? ', 1' : ''});`);
   }
   for (const ic of ifCalls) {
     ctx.runtimeNeeded.add('ifBlock');
@@ -703,6 +888,18 @@ function emitBindingMount(b, elVar) {
       return `    _b._el$${b.id} = ${elVar};
     ${elVar}.$$${b.eventName} = (${b.expr});`;
     }
+    case 'event-bundle': {
+      // Build a `{ fn, args }` bundle and stash fn + each arg in slots so the
+      // update path can identity-diff and skip the reassignment on no-op.
+      const argSlots = b.argExprs.map((_e, i) => `_b._a$${b.id}$${i}`);
+      const argInit = b.argExprs.map((e, i) => `_b._a$${b.id}$${i} = (${e});`).join(' ');
+      return `    {
+      _b._el$${b.id} = ${elVar};
+      _b._fn$${b.id} = (${b.fnExpr});
+      ${argInit}
+      ${elVar}.$$${b.eventName} = { fn: _b._fn$${b.id}, args: [${argSlots.join(', ')}] };
+    }`;
+    }
     case 'ref': {
       // Callback ref → call with the element; object ref → set .current.
       // Register a scope cleanup so unmount clears the ref to null (React parity).
@@ -756,6 +953,21 @@ function emitBindingUpdate(b) {
     }
     case 'event': {
       return `    _b._el$${b.id}.$$${b.eventName} = (${b.expr});`;
+    }
+    case 'event-bundle': {
+      // Diff fn + each arg against the per-slot cache. Only rebuild + assign
+      // the bundle when something actually changed — keyed-list survivors with
+      // unchanged item refs skip everything.
+      const fnVar = `_fn`, argVars = b.argExprs.map((_e, i) => `_a${i}`);
+      const reads = `const ${fnVar} = (${b.fnExpr}); ` + b.argExprs.map((e, i) => `const ${argVars[i]} = (${e});`).join(' ');
+      const cmps = [`_b._fn$${b.id} !== ${fnVar}`]
+        .concat(b.argExprs.map((_e, i) => `_b._a$${b.id}$${i} !== ${argVars[i]}`))
+        .join(' || ');
+      const writes = [`_b._fn$${b.id} = ${fnVar};`]
+        .concat(b.argExprs.map((_e, i) => `_b._a$${b.id}$${i} = ${argVars[i]};`))
+        .concat([`_b._el$${b.id}.$$${b.eventName} = { fn: ${fnVar}, args: [${argVars.join(', ')}] };`])
+        .join(' ');
+      return `    { ${reads} if (${cmps}) { ${writes} } }`;
     }
     case 'ref': {
       // Ref expression identity may change across renders — re-attach if so.
@@ -915,7 +1127,21 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
     if (attrName.length > 2 && attrName.startsWith('on') && /^[A-Z]/.test(attrName[2])) {
       const eventName = attrName.slice(2).toLowerCase();
       ctx.delegatedEvents.add(eventName);
-      bindings.push({ id: bindings.length, kind: 'event', expr, path, eventName, ns: hostNs });
+      // Hot-path optimisation: `() => fn(arg, …)` arrows with zero params get
+      // compiled to a `{ fn, args }` bundle so the runtime can identity-diff
+      // fn + each arg and skip the property reassignment when nothing
+      // changed. Huge win for keyed-list survivors whose item refs are
+      // unchanged (e.g. js-framework-benchmark swap rows).
+      const bundleInfo = detectStableEventBundle(inner);
+      if (bundleInfo) {
+        bindings.push({
+          id: bindings.length, kind: 'event-bundle', path, eventName, ns: hostNs,
+          fnExpr: printExprWithTsrx(bundleInfo.callee, ctx, componentName, inlinedSubs),
+          argExprs: bundleInfo.args.map((a) => printExprWithTsrx(a, ctx, componentName, inlinedSubs)),
+        });
+      } else {
+        bindings.push({ id: bindings.length, kind: 'event', expr, path, eventName, ns: hostNs });
+      }
     } else if (attrName === 'class' || attrName === 'className') {
       bindings.push({ id: bindings.length, kind: 'class', expr, path, ns: hostNs });
     } else {
@@ -1375,12 +1601,36 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
   const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash);
   inlinedSubs.push(itemFnSource + ';');
 
+  // Purity check — if the body references nothing from the enclosing
+  // component's outer locals (only the item, locals it declares itself,
+  // imports, and globals) AND uses no hooks (which read dynamic state like
+  // context, refs, state setters), the runtime can SKIP re-rendering
+  // survivors whose item ref + index are unchanged. That's the auto-memo
+  // path: it lets keyed reorders (swap, etc.) avoid wasted work on the 99%
+  // of rows that didn't change. Bodies that close over parent state OR call
+  // hooks are correctly identified as impure and re-render normally.
+  let pure = false;
+  if (ctx.currentComponentLocals) {
+    const bodyScope = new Set([itemName]);
+    if (node.index) bodyScope.add(node.index.name);
+    const bodyAst = { type: 'BlockStatement', body: subStmts };
+    const free = collectFreeIdentifiers(bodyAst, bodyScope);
+    pure = true;
+    for (const name of free) {
+      if (ctx.currentComponentLocals.has(name)) { pure = false; break; }
+      // Hooks (use, useState, useEffect, …) read dynamic state — their
+      // results can change across renders without the item changing.
+      if (HOOK_NAMES.has(name) || name === 'use') { pure = false; break; }
+    }
+  }
+
   return {
     id: ctx.nextHelperId++,
     itemsExpr,
     keyHelper,
     bodyHelper: itemHelperName,
     extraExpr: 'undefined',
+    pure,
     hostPath: null,
   };
 }
