@@ -243,6 +243,34 @@ function collectFreeIdentifiers(root, initiallyBound) {
 }
 
 /**
+ * Walk a for-of body looking for anything whose render is opaque to us —
+ * component calls (`<Foo/>`, `<ctx.X/>`) or control-flow that wraps them
+ * (`if`/`for`/`try`). Such constructs can read dynamic state (context,
+ * setters, descendant hooks) during their own render, so skipping the
+ * parent re-render would skip them too. Conservative match: any of those at
+ * any depth → not memo-safe.
+ */
+function containsComponentCallOrControlFlow(stmts) {
+  let found = false;
+  function walk(n) {
+    if (found || !n) return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if (typeof n !== 'object') return;
+    const t = n.type;
+    if (!t) return;
+    if (t === 'Element' && isComponentTag(n)) { found = true; return; }
+    if (t === 'IfStatement' || t === 'ForOfStatement' || t === 'TryStatement') { found = true; return; }
+    if (t === 'TSRXExpression' && n.expression && isCreatePortalCall(n.expression)) { found = true; return; }
+    for (const key in n) {
+      if (key === 'type' || key === 'loc' || key === 'start' || key === 'end' || key === 'range' || key === 'metadata') continue;
+      walk(n[key]);
+    }
+  }
+  for (const s of stmts) walk(s);
+  return found;
+}
+
+/**
  * `() => fn(a, b, …)` — a zero-param arrow whose body is a single
  * function call. Returns `{ callee, args }` if so, else null. Used to compile
  * event handlers to the runtime's `{ fn, args }` bundle form so the
@@ -1622,6 +1650,11 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
       // results can change across renders without the item changing.
       if (HOOK_NAMES.has(name) || name === 'use') { pure = false; break; }
     }
+    // Component calls inside the body (e.g. `<Foo />`) may read context or
+    // other dynamic state during their own render — skipping the parent
+    // re-render would skip them too, so we can't safely memo. Same for
+    // top-level if/for/try (they can wrap component calls transitively).
+    if (pure && containsComponentCallOrControlFlow(subStmts)) pure = false;
   }
 
   return {

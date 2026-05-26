@@ -18,6 +18,7 @@ import {
   TernaryFragmentChild, HtmlOnlyChild,
   KeyedFragmentItems, LazyObjectDestructure, LazyArrayDestructure,
   LazyParamDestructure, LazyForOfHead, ShorthandComponentProp,
+  PureForOf, ImpureForOf,
 } from './_fixtures/tsrx-features.tsrx';
 
 // ---------------------------------------------------------------------------

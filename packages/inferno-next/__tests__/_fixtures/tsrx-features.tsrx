@@ -157,3 +157,32 @@ export component ShorthandComponentProp() {
   const count = 7;
   <ShorthandChild {label} {count}/>
 }
+
+// ---------------------------------------------------------------------------
+// Auto-memo: for-of bodies that don't close over parent locals OR call hooks
+// OR mount components are statically detected as PURE — survivors with
+// unchanged item refs skip the body re-render entirely. The fixture exposes
+// a `renderCount` side effect via a non-component callback so the test can
+// prove skipping happened.
+// ---------------------------------------------------------------------------
+
+// PURE: body uses only `row` (the item) — no parent closures, no hooks, no
+// component calls. Should be marked pure → survivors skip renderBlock.
+export component PureForOf(props) {
+  <ul>
+    for (const row of props.items; key row.id) {
+      <li class={'r-' + row.id}>{text row.label}</li>
+    }
+  </ul>
+}
+
+// IMPURE: body reads `selected` from parent scope → must re-render survivors
+// when parent state changes (otherwise the row's class won't reflect new
+// selected state).
+export component ImpureForOf(props) {
+  <ul>
+    for (const row of props.items; key row.id) {
+      <li class={props.selected === row.id ? 'sel' : ''}>{text row.label}</li>
+    }
+  </ul>
+}
