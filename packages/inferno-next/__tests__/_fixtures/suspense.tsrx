@@ -1,4 +1,4 @@
-import { use, useState, useEffect, useDeferredValue } from 'inferno-next';
+import { use, useState, useEffect, useMemo, useDeferredValue } from 'inferno-next';
 
 // ---------------------------------------------------------------------------
 // Basic Suspense flow — try/pending/catch with a use(promise) inside try.
@@ -49,13 +49,13 @@ export component TwoUses(props) {
   }
 }
 
-// `try keep` mode — once resolved, subsequent re-renders that suspend keep
-// the prior DOM visible. Use the React-idiomatic `useDeferredValue` to detect
-// staleness: when `props.promise !== deferred`, you're rendering with old
-// data while the new promise loads in the background.
-export component KeepMode(props) {
+// useDeferredValue + use() — the React-idiomatic stale-data pattern. When
+// `props.promise` changes, useDeferredValue returns the prior value for one
+// render, then commits the new value on a microtask. The first render reads
+// the cached fulfilled state of the old promise (no suspend) and can flag
+// `isStale`; the deferred-commit render suspends on the new promise.
+export component DeferredSwap(props) {
   try {
-    'use keep';
     const deferred = useDeferredValue(props.promise);
     const isStale = props.promise !== deferred;
     const value = use(deferred);
@@ -177,5 +177,67 @@ export component NestedRevealOrder(props) {
     </div>
   } pending {
     <div class='a-loading'>{text 'A-loading'}</div>
+  }
+}
+
+// Two SIBLING try blocks — both render in the same outer pass so their
+// fetches kick off in parallel; both `.then` listeners are armed before
+// either resolves. No waterfall: A doesn't have to resolve before B starts.
+component LeafA(props) {
+  try {
+    const v = use(props.p);
+    <li class='leaf-a'>{text 'A:' + v}</li>
+  } pending {
+    <li class='leaf-a-loading'>{text 'A-loading'}</li>
+  }
+}
+
+component LeafB(props) {
+  try {
+    const v = use(props.p);
+    <li class='leaf-b'>{text 'B:' + v}</li>
+  } pending {
+    <li class='leaf-b-loading'>{text 'B-loading'}</li>
+  }
+}
+
+export component SiblingBoundaries(props) {
+  // The two fetches are EAGER — created when ParentRender ran, so both
+  // promises are already in flight before either Leaf component mounts.
+  <ul>
+    <LeafA p={props.a} />
+    <LeafB p={props.b} />
+  </ul>
+}
+
+// Within a SINGLE try body, the React idiom for parallel fetches is to
+// kick them off via useMemo BEFORE reading them via use(). Otherwise the
+// first use() throws and the second fetch never starts → classic waterfall.
+export component ParallelInOneBoundary(props) {
+  try {
+    // Start BOTH fetches in parallel via a useMemo that runs once per
+    // (cacheKey) change. The use() calls just read the already-running
+    // promises in sequence — no waterfall.
+    const [pa, pb] = useMemo(() => [props.startA(), props.startB()], [props.cacheKey]);
+    const a = use(pa);
+    const b = use(pb);
+    <div class='both'>{text a + '/' + b}</div>
+  } pending {
+    <div class='fallback'>{text 'loading'}</div>
+  }
+}
+
+// Negative case: WITHOUT useMemo, the two fetches happen in sequence
+// because the body is re-entered from scratch on each replay attempt.
+// On render 1: startA() called, throws. startB() not called.
+// On render 2 (after A resolves): startA() returns cached, startB() called.
+// We expose call counters so the test can prove the waterfall happened.
+export component WaterfallBody(props) {
+  try {
+    const a = use(props.startA());
+    const b = use(props.startB());
+    <div class='both'>{text a + '/' + b}</div>
+  } pending {
+    <div class='fallback'>{text 'loading'}</div>
   }
 }

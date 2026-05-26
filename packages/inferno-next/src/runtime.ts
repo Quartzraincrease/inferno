@@ -185,7 +185,7 @@ export function drainPassiveEffects(): void {
 }
 
 /** True if there's a queued render or any uncommitted effect. Used by `act`. */
-export function hasPendingWork(): boolean {
+function hasPendingWork(): boolean {
   return QUEUE.length > 0
     || effectQueues[INSERTION].length > 0
     || effectQueues[LAYOUT].length > 0
@@ -681,7 +681,7 @@ function useContextInternal<T>(context: Context<T>): T {
 // Suspense — use(thenable) and the SuspenseException sentinel.
 // ---------------------------------------------------------------------------
 
-export interface TrackedThenable<T = any> extends PromiseLike<T> {
+interface TrackedThenable<T = any> extends PromiseLike<T> {
   status?: 'pending' | 'fulfilled' | 'rejected';
   value?: T;
   reason?: any;
@@ -698,7 +698,7 @@ class SuspenseException {
   constructor(public readonly thenable: TrackedThenable<any>) {}
 }
 
-export function isSuspenseException(x: any): x is SuspenseException {
+function isSuspenseException(x: any): x is SuspenseException {
   return x !== null && typeof x === 'object' && (x as any).__isSuspense === true;
 }
 
@@ -1039,19 +1039,25 @@ interface TrySlot {
   end: Comment;
   // -1 init, 0 catch, 1 try (resolved), 2 pending
   branch: -1 | 0 | 1 | 2;
+  /**
+   * Currently-visible block (try body, pending fallback, or catch body).
+   * NOT necessarily the same as `tryBlock` — when pending is shown, `block`
+   * is the pending block and `tryBlock` is preserved off-screen.
+   */
   block: Block | null;
+  /**
+   * Persistent try-body block. Survives suspend/resume cycles so its
+   * `scope.hooks` (useState/useMemo/useRef state) replays just like React's
+   * WIP-fiber-discard-but-keep-memoizedState contract. Cleared by `catch`
+   * and by `reset()` since those are explicit fresh starts.
+   */
+  tryBlock: Block | null;
+  /** DOM nodes (incl. markers) detached during suspend; reinserted on resume. */
+  savedDom: Node[] | null;
   tryBody: ComponentBody;
   catchBody: ComponentBody | null;
   pendingBody: ComponentBody | null;
-  /**
-   * Solid <Loading>-style mode: once the try body has rendered successfully,
-   * subsequent suspends do NOT swap to the pending fallback — the prior DOM
-   * stays visible, and useTryPending() returns true inside the body for
-   * "stale data" styling. Caveat: a re-render attempt may mutate DOM partway
-   * before suspending, so place use() calls early.
-   */
-  keep: boolean;
-  /** Has the try body ever rendered to completion? Gates keep-mode behavior. */
+  /** Has the try body ever rendered to completion? Diagnostic only. */
   hasResolved: boolean;
   err: any;
   /** The thenable we're currently waiting on (so duplicate listeners don't fire). */
@@ -1067,7 +1073,6 @@ export function tryBlock(
   tryBody: ComponentBody,
   catchBody: ComponentBody | null,
   pendingBody: ComponentBody | null,
-  keep: boolean,
 ): void {
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as TrySlot | undefined;
@@ -1078,7 +1083,8 @@ export function tryBlock(
     domParent.appendChild(end);
     const newState: TrySlot = {
       __kind: 'trySlotSlot', start, end, branch: -1, block: null,
-      tryBody, catchBody, pendingBody, keep,
+      tryBlock: null, savedDom: null,
+      tryBody, catchBody, pendingBody,
       hasResolved: false,
       err: null, pendingThenable: null,
       domParent, parentBlock,
@@ -1089,7 +1095,6 @@ export function tryBlock(
     state.tryBody = tryBody;
     state.catchBody = catchBody;
     state.pendingBody = pendingBody;
-    state.keep = keep;
   }
   const s = state;
   if (s.branch === 0) {
@@ -1099,25 +1104,37 @@ export function tryBlock(
     renderBlock(s.block!);
   } else if (s.branch === 2) {
     // Already pending — no work; will be swapped when thenable resolves.
-  } else if (s.branch === 1 && s.block) {
-    // Already showing the resolved try body — re-render in place so we don't
-    // tear down its DOM (critical for keep mode, but also avoids mount churn
-    // in the default case). If the re-render suspends, handleSuspense decides
+  } else if (s.branch === 1 && s.tryBlock) {
+    // Try body is currently visible — re-render in place so we don't tear
+    // down its DOM. If the re-render suspends, handleSuspense decides
     // whether to preserve the DOM (keep) or swap to pending (default).
-    s.block.body = s.tryBody;
+    s.tryBlock.body = s.tryBody;
     try {
-      renderBlock(s.block);
+      renderBlock(s.tryBlock);
     } catch (err) {
-      if (isSuspenseException(err)) handleSuspense(s, err.thenable, s.block);
+      if (isSuspenseException(err)) handleSuspense(s, err.thenable, s.tryBlock);
       else switchToCatch(s, err);
     }
+  } else if (s.tryBlock && s.savedDom) {
+    // Pending is visible AND we have a preserved try block — re-render it
+    // (it'll throw again at the same use() since the promise hasn't
+    // resolved). This entry point is hit when the surrounding component
+    // re-renders for an unrelated reason while we're suspended.
+    s.tryBlock.body = s.tryBody;
+    try { renderBlock(s.tryBlock); }
+    catch { /* expected: still pending; handled by attachResume */ }
   } else {
     mountTry(s);
   }
 }
 
 function mountTry(state: TrySlot): void {
-  if (state.block) { unmountBlock(state.block); state.block = null; }
+  // Fresh start. If there's leftover state from a prior cycle (e.g. after
+  // catch reset), clear it first.
+  if (state.tryBlock) { unmountBlock(state.tryBlock); state.tryBlock = null; }
+  if (state.block && state.block !== state.tryBlock) { unmountBlock(state.block); state.block = null; }
+  state.savedDom = null;
+  state.hasResolved = false;
   state.branch = 1;
   const bStart = document.createComment('try-b');
   const bEnd = document.createComment('/try-b');
@@ -1130,21 +1147,50 @@ function mountTry(state: TrySlot): void {
   (b as any).__suspenseHandler = (thenable: TrackedThenable<any>, sourceBlock: Block) => {
     handleSuspense(state, thenable, sourceBlock);
   };
+  state.tryBlock = b;
   state.block = b;
   try {
     renderBlock(b);
     state.hasResolved = true;
   } catch (err) {
     if (isSuspenseException(err)) {
-      // Initial render (or post-resolve re-mount) suspended. The block was just
-      // created in mountTry above — tear down its partial DOM and switch to
-      // pending. `hasResolved` stays false, so keep-mode won't kick in yet.
       handleSuspense(state, err.thenable, b);
     } else {
-      if (state.block) { unmountBlock(state.block); state.block = null; }
+      if (state.tryBlock) { unmountBlock(state.tryBlock); state.tryBlock = null; state.block = null; }
       switchToCatch(state, err);
     }
   }
+}
+
+/**
+ * Detach the try block's DOM range from the document, saving the nodes for
+ * later reinsertion. Crucially: does NOT unmount the block, run cleanups, or
+ * clear `_b.*` bindings — so `useState`/`useMemo`/`useRef` state AND the
+ * `_b._el$N` DOM-node references survive intact (the same DOM nodes will
+ * be reinserted into the same parent on resume, so the references stay valid).
+ * Mirrors React's "WIP-fiber-discarded-but-committed-state-preserved" contract.
+ */
+function softDetachTryBlock(state: TrySlot): void {
+  if (!state.tryBlock || state.savedDom) return;
+  const saved: Node[] = [];
+  const start = state.tryBlock.startMarker!;
+  const end = state.tryBlock.endMarker!;
+  const parent = start.parentNode!;
+  let n: Node | null = start;
+  while (n) {
+    const next: Node | null = n.nextSibling;
+    saved.push(n);
+    parent.removeChild(n);
+    if (n === end) break;
+    n = next;
+  }
+  state.savedDom = saved;
+}
+
+function reattachTryBlock(state: TrySlot): void {
+  if (!state.savedDom) return;
+  for (const n of state.savedDom) state.domParent.insertBefore(n, state.end);
+  state.savedDom = null;
 }
 
 function handleSuspense(
@@ -1152,22 +1198,20 @@ function handleSuspense(
   thenable: TrackedThenable<any>,
   sourceBlock: Block,
 ): void {
-  const keepDom = state.keep && state.hasResolved && sourceBlock === state.block;
-
-  if (keepDom) {
-    // Solid <Loading>-style: do NOT tear down the prior DOM. The body may
-    // have partially mutated DOM before throwing at use() — those mutations
-    // stay visible. To get a clean "stale data + new query" handoff, users
-    // wrap the query in `useDeferredValue` so the suspending render is
-    // ALWAYS preceded by a sync re-render at the old query value.
-    attachResume(state, thenable, /* retryViaRender */ true);
-    return;
+  if (sourceBlock === state.tryBlock) {
+    // The try-body block itself suspended (initial render OR re-render).
+    // PRESERVE its hooks Map and `_b.*` bindings so useMemo/useState etc.
+    // survive across replays — matches React's WIP-discard contract where
+    // even an unfinished render's hook state is committed for replay.
+    softDetachTryBlock(state);
+  } else {
+    // Nested-block suspended — pop the whole try subtree. (Rare in current
+    // codegen; future enhancement could preserve more granularly.)
+    if (state.tryBlock) { unmountBlock(state.tryBlock); state.tryBlock = null; }
   }
-
-  // Otherwise: unmount whatever's currently shown (partial try DOM, or a
-  // stale pending block) and mount the pending fallback.
-  if (state.block) { unmountBlock(state.block); state.block = null; }
+  state.block = null;
   state.branch = 2;
+
   if (state.pendingBody) {
     const bStart = document.createComment('pend-b');
     const bEnd = document.createComment('/pend-b');
@@ -1176,16 +1220,14 @@ function handleSuspense(
     const b = createBlock('control-flow', state.parentBlock, state.domParent, bStart, bEnd, state.pendingBody, undefined);
     (b as any).__trySlot = state;
     state.block = b;
-    try {
-      renderBlock(b);
-    } catch (err) {
-      // Pending body itself threw — bubble to catch.
+    try { renderBlock(b); }
+    catch (err) {
       if (state.block) { unmountBlock(state.block); state.block = null; }
       switchToCatch(state, err);
       return;
     }
   }
-  attachResume(state, thenable, /* retryViaRender */ false);
+  attachResume(state, thenable);
 }
 
 /**
@@ -1193,27 +1235,33 @@ function handleSuspense(
  * settles. Dedupes by `pendingThenable` so two suspends on the same promise
  * don't queue two retries.
  */
-function attachResume(
-  state: TrySlot,
-  thenable: TrackedThenable<any>,
-  retryViaRender: boolean,
-): void {
+function attachResume(state: TrySlot, thenable: TrackedThenable<any>): void {
   if (state.pendingThenable === thenable) return;
   state.pendingThenable = thenable;
   const retry = () => {
-    if (state.pendingThenable !== thenable) return;  // superseded
+    if (state.pendingThenable !== thenable) return;  // superseded by a fresher suspend
     state.pendingThenable = null;
-    if (retryViaRender && state.block && !state.block.disposed) {
-      // Keep-mode retry: just re-render the existing try block in place.
+    // If we preserved the try block via softDetach (initial suspend OR
+    // re-render suspend), reattach + re-render in place — hooks state is
+    // intact so useMemo/useState etc. don't re-run. Otherwise mount fresh
+    // (e.g. after catch reset).
+    if (state.tryBlock && state.savedDom && !state.tryBlock.disposed) {
+      if (state.block && state.block !== state.tryBlock) {
+        unmountBlock(state.block);
+        state.block = null;
+      }
+      reattachTryBlock(state);
+      state.block = state.tryBlock;
+      state.branch = 1;
+      state.tryBlock.body = state.tryBody;
       try {
-        renderBlock(state.block);
+        renderBlock(state.tryBlock);
         state.hasResolved = true;
       } catch (err) {
-        if (isSuspenseException(err)) handleSuspense(state, err.thenable, state.block!);
+        if (isSuspenseException(err)) handleSuspense(state, err.thenable, state.tryBlock!);
         else switchToCatch(state, err);
       }
     } else {
-      // Non-keep / initial: remount the try body fresh.
       mountTry(state);
     }
   };
@@ -1258,7 +1306,21 @@ export function useDeferredValue<T>(value: T, slot: symbol): T {
 }
 
 function switchToCatch(state: TrySlot, err: any): void {
-  if (state.block) { unmountBlock(state.block); state.block = null; }
+  // Catch is a fresh terminal state — discard any preserved try-body hook
+  // state. `reset()` will mountTry fresh from the catch arm if user retries.
+  if (state.tryBlock) { unmountBlock(state.tryBlock); state.tryBlock = null; }
+  if (state.savedDom) {
+    // DOM was detached — discard the saved nodes since the block they
+    // belonged to is being torn down (unmountBlock above wouldn't see them
+    // because they're detached from the document).
+    state.savedDom = null;
+  }
+  if (state.block && state.block !== state.tryBlock) {
+    unmountBlock(state.block);
+    state.block = null;
+  }
+  state.hasResolved = false;
+  state.pendingThenable = null;
   // No catch arm — bubble to the next enclosing tryBlock (or surface).
   if (state.catchBody === null) {
     const parent = findTryHandler(state.parentBlock);

@@ -574,7 +574,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   ctx._portalCalls = [];
   for (const tc of tryCalls) {
     ctx.runtimeNeeded.add('tryBlock');
-    afterLines.push(`  tryBlock(__s, ${JSON.stringify('_try$' + tc.id)}, __s.${bindingsName}._tryHost$${tc.id}, ${tc.tryHelper}, ${tc.catchHelper}, ${tc.pendingHelper}, ${tc.keep ? 'true' : 'false'});`);
+    afterLines.push(`  tryBlock(__s, ${JSON.stringify('_try$' + tc.id)}, __s.${bindingsName}._tryHost$${tc.id}, ${tc.tryHelper}, ${tc.catchHelper}, ${tc.pendingHelper});`);
   }
 
   return {
@@ -1056,18 +1056,7 @@ function makeCompCall(node, ctx, componentName, inlinedSubs, bindings, forCalls,
 function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', cssHash = null) {
   // node.block = try BlockStatement, node.handler = CatchClause (param, resetParam, body),
   // node.pending = optional BlockStatement (TSRX `pending { ... }`)
-  let tryStmts = node.block.body;
-  // Solid <Loading>-style opt-in: `'use keep'` directive at the top of the
-  // try body. Strip it from the compiled body and flag the runtime call.
-  let keep = false;
-  if (tryStmts.length > 0
-      && tryStmts[0].type === 'ExpressionStatement'
-      && tryStmts[0].expression
-      && tryStmts[0].expression.type === 'Literal'
-      && tryStmts[0].expression.value === 'use keep') {
-    keep = true;
-    tryStmts = tryStmts.slice(1);
-  }
+  const tryStmts = node.block.body;
   const tryHelperName = `__try$${ctx.nextHelperId++}`;
   const tryFake = {
     type: 'Component',
@@ -1134,7 +1123,6 @@ function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     tryHelper: tryHelperName,
     catchHelper: catchHelperName,
     pendingHelper: pendingHelperName,
-    keep,
     hostPath: null,
   };
 }

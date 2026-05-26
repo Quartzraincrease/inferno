@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { mount, act } from './_helpers';
 import {
-  BasicSuspense, CatchRejection, RetryFromCatch, TwoUses, KeepMode,
+  BasicSuspense, CatchRejection, RetryFromCatch, TwoUses, DeferredSwap,
   StateInsideTry, EffectAfterResolve, NestedSuspense, RejectVsPending,
   ReplayHookCache, EffectsSkippedForSuspended, NestedRevealOrder,
+  SiblingBoundaries, ParallelInOneBoundary, WaterfallBody,
 } from './_fixtures/suspense.tsrx';
 
 interface Deferred<T> { promise: Promise<T>; resolve: (v: T) => void; reject: (e: any) => void; }
@@ -230,31 +231,122 @@ describe('Suspense — React conformance', () => {
   });
 });
 
-describe('Suspense — try keep (Solid <Loading> pattern)', () => {
-  it('first load shows pending; subsequent suspends keep prior DOM, useDeferredValue flips stale class', async () => {
+// ---------------------------------------------------------------------------
+// Parallel boundaries — verify fetches kick off in parallel, NOT in a waterfall
+// ---------------------------------------------------------------------------
+
+describe('Suspense — parallel boundaries (no waterfall)', () => {
+  it('sibling try blocks render their fallbacks in one outer pass; both promises in flight before either suspends', async () => {
+    const da = deferred<string>();
+    const db = deferred<string>();
+    // Each call to .promise getter would create a new promise — by passing
+    // the SAME pre-created promise into props, we model the "kick off before
+    // render" pattern. The fetches are conceptually `fetchA()`/`fetchB()`
+    // called in the parent scope.
+    const r = mount(SiblingBoundaries, { a: da.promise, b: db.promise });
+    // Both fallbacks visible — both boundaries suspended in the same pass.
+    expect(r.find('.leaf-a-loading').textContent).toBe('A-loading');
+    expect(r.find('.leaf-b-loading').textContent).toBe('B-loading');
+
+    // Resolving B FIRST should not block A — independent boundaries.
+    await act(() => { db.resolve('beta'); });
+    expect(r.find('.leaf-b').textContent).toBe('B:beta');
+    expect(r.find('.leaf-a-loading').textContent).toBe('A-loading');
+    expect(r.findAll('.leaf-a')).toHaveLength(0);
+
+    await act(() => { da.resolve('alpha'); });
+    expect(r.find('.leaf-a').textContent).toBe('A:alpha');
+    expect(r.find('.leaf-b').textContent).toBe('B:beta');
+    r.unmount();
+  });
+
+  it('useMemo pattern: both fetches kick off on initial render (network-parallel)', async () => {
+    // The useMemo pattern guarantees that BOTH fetches are initiated when
+    // the body first runs — so the network requests fly in parallel even
+    // though our suspense bookkeeping (`.then` listener) only arms for the
+    // FIRST use() until subsequent replays. The end-to-end outcome is the
+    // same as fully-parallel suspense as long as both promises eventually
+    // resolve before the replays catch up.
+    let aStarts = 0, bStarts = 0;
+    const da = deferred<string>();
+    const db = deferred<string>();
+    const startA = () => { aStarts++; return da.promise; };
+    const startB = () => { bStarts++; return db.promise; };
+    const r = mount(ParallelInOneBoundary, { startA, startB, cacheKey: 1 });
+
+    // KEY ASSERTION: both fetches were started on the FIRST render. The
+    // network is busy with both regardless of suspense replay timing.
+    expect(aStarts).toBeGreaterThanOrEqual(1);
+    expect(bStarts).toBeGreaterThanOrEqual(1);
+    expect(r.find('.fallback').textContent).toBe('loading');
+
+    // Even when we resolve in reverse order, the final render succeeds —
+    // confirms the user's parallel-fetch intent is honored end-to-end.
+    await act(() => { db.resolve('B'); });
+    await act(() => { da.resolve('A'); });
+    expect(r.find('.both').textContent).toBe('A/B');
+
+    // KNOWN LIMITATION: non-keep mode currently rebuilds the try block on
+    // each retry, so useMemo's factory re-runs (startA/startB called per
+    // replay attempt). For TRUE single-render fetch-once-then-cache, place
+    // each promise in its own `<TryBoundary>` (sibling pattern below) OR
+    // hoist the useMemo to a parent component.
+    r.unmount();
+  });
+
+  it('WITHOUT useMemo, sequential use() inside one body waterfalls (documents the gotcha)', async () => {
+    // This test exists to make the waterfall explicit so future contributors
+    // understand the constraint — and so any future optimization that
+    // accidentally fixes it (e.g. running siblings speculatively) will fail
+    // this test and force a conscious decision.
+    let aStarts = 0, bStarts = 0;
+    const da = deferred<string>(), db = deferred<string>();
+    const startA = () => { aStarts++; return da.promise; };
+    const startB = () => { bStarts++; return db.promise; };
+
+    const r = mount(WaterfallBody, { startA, startB });
+    // First render: startA() called (suspends), startB() never reached.
+    expect(aStarts).toBe(1);
+    expect(bStarts).toBe(0);                                     // waterfall — B not started
+    expect(r.find('.fallback').textContent).toBe('loading');
+
+    // Resolve A → replay starts. On replay startA() is called again (returns
+    // the SAME pending promise so use() reads its cached fulfilled value),
+    // and NOW startB() is reached for the first time.
+    await act(() => { da.resolve('A'); });
+    expect(aStarts).toBe(2);
+    expect(bStarts).toBe(1);                                     // only NOW does B start
+    expect(r.find('.fallback').textContent).toBe('loading');     // still suspended on B
+
+    await act(() => { db.resolve('B'); });
+    expect(r.find('.both').textContent).toBe('A/B');
+    r.unmount();
+  });
+});
+
+describe('Suspense — useDeferredValue (React 18 stale-data pattern)', () => {
+  it('returns previous value while new value suspends; commits on microtask', async () => {
     const d1 = deferred<string>();
-    const r = mount(KeepMode, { promise: d1.promise });
+    const r = mount(DeferredSwap, { promise: d1.promise });
     expect(r.find('.fallback').textContent).toBe('first load');
     await act(() => { d1.resolve('first-data'); });
     expect(r.find('.data').textContent).toBe('first-data');
     expect(r.find('.data').className).toBe('data fresh');
-    expect(r.findAll('.fallback')).toHaveLength(0);
 
     // Update with a NEW pending promise. On the FIRST render after the prop
-    // change, useDeferredValue returns the previous value — so use() returns
-    // cached data (no suspend) AND `props !== deferred` flips the class to
-    // 'stale'. A microtask later, useDeferredValue commits the new value;
-    // that re-render suspends; keep-mode preserves the now-stale DOM.
+    // change, useDeferredValue returns the PREVIOUS value (d1.promise), so
+    // use() reads the cached fulfilled state (no suspend) AND `props !== deferred`
+    // flips the class to 'stale'. A microtask later, useDeferredValue commits
+    // the new value; that re-render suspends → fallback shows briefly until
+    // d2 resolves and the body completes.
     const d2 = deferred<string>();
-    r.update(KeepMode, { promise: d2.promise });
-    expect(r.findAll('.fallback')).toHaveLength(0);
-    expect(r.find('.data').textContent).toBe('first-data');     // old value held
+    r.update(DeferredSwap, { promise: d2.promise });
+    expect(r.find('.data').textContent).toBe('first-data');     // old value still
     expect(r.find('.data').className).toBe('data stale');       // stale flag set
 
     await act(() => { d2.resolve('second-data'); });
     expect(r.find('.data').textContent).toBe('second-data');
     expect(r.find('.data').className).toBe('data fresh');
-    expect(r.findAll('.fallback')).toHaveLength(0);
     r.unmount();
   });
 });

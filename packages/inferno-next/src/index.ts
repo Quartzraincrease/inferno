@@ -5,7 +5,6 @@ export {
   createRoot,
   flushSync,
   drainPassiveEffects,
-  hasPendingWork,
   act,
   type Root,
 
@@ -28,9 +27,6 @@ export {
   use,
   type Context,
 
-  // Suspense
-  isSuspenseException,
-  type TrackedThenable,
 
   // Compiler-emitted runtime helpers
   template,
