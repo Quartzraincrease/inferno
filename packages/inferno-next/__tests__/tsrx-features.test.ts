@@ -340,6 +340,64 @@ describe('TSRX features — shorthand props on components', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Auto-memo: pure for-of bodies skip renderBlock for unchanged item refs
+// ---------------------------------------------------------------------------
+
+describe('TSRX features — for-of auto-memo (pure body skip)', () => {
+  // Builds a row whose `label` getter increments a counter on every read —
+  // so we can observe whether the body actually re-ran during a reorder.
+  function spyItem(id: number, label: string, counter: { n: number }) {
+    const o: any = { id };
+    Object.defineProperty(o, 'label', { get() { counter.n++; return label; } });
+    return o;
+  }
+
+  it('PURE body skips renderBlock for survivors with unchanged item refs', () => {
+    const reads = { n: 0 };
+    const a = spyItem(1, 'a', reads);
+    const b = spyItem(2, 'b', reads);
+    const c = spyItem(3, 'c', reads);
+    const r = mount(PureForOf, { items: [a, b, c] });
+    expect(r.findAll('li').map(li => li.textContent)).toEqual(['a', 'b', 'c']);
+    const baseline = reads.n;
+
+    // Reorder — same item refs, different positions. With auto-memo the
+    // body should NOT re-read `label` on any item (item refs + positions
+    // both still resolved correctly: pos 0 has a, pos 2 has c — survivors
+    // at positions 1 swap; only the actual movers should re-render).
+    // Actually for a reverse, EVERY position's item ref changed → all
+    // re-render. Test a SWAP-of-2 to keep most in place.
+    r.update(PureForOf, { items: [c, b, a] });   // reverse: every pos changes
+    const afterReverse = reads.n - baseline;
+    expect(afterReverse).toBeGreaterThan(0);     // moved items did re-render
+
+    // Now PASS THE SAME ARRAY again — every item ref + position unchanged.
+    // With memo: zero reads. Without memo: 3 reads.
+    reads.n = 0;
+    r.update(PureForOf, { items: [c, b, a] });
+    expect(reads.n).toBe(0);                     // ← the auto-memo proof
+    r.unmount();
+  });
+
+  it('IMPURE body (closes over `props.selected`) DOES re-render survivors', () => {
+    const reads = { n: 0 };
+    const a = spyItem(1, 'a', reads);
+    const b = spyItem(2, 'b', reads);
+    const c = spyItem(3, 'c', reads);
+    const r = mount(ImpureForOf, { items: [a, b, c], selected: 0 });
+    expect(r.findAll('li.sel')).toHaveLength(0);
+    reads.n = 0;
+
+    // Change `selected` (parent state) — the body must re-evaluate even
+    // though item refs are identical, so the class binding updates.
+    r.update(ImpureForOf, { items: [a, b, c], selected: 2 });
+    expect(reads.n).toBeGreaterThan(0);          // re-rendered all 3
+    expect(r.find('li.sel').textContent).toBe('b');  // item with id=2
+    r.unmount();
+  });
+});
+
 describe('TSRX features — {html expr} only-child', () => {
   it('sets innerHTML so the markup parses into real DOM', () => {
     const r = mount(HtmlOnlyChild, {
