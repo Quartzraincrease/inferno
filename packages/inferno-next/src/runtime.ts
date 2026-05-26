@@ -497,6 +497,11 @@ function unmountScope(scope: Scope): void {
         for (let r = it.next(); !r.done; r = it.next()) unmountBlock(r.value);
       } else if (val && (val.__kind === 'componentSlotSlot' || val.__kind === 'portalSlotSlot' || val.__kind === 'trySlotSlot')) {
         if (val.block) unmountBlock(val.block);
+        // Release the portal target's delegation refcount so the listeners
+        // detach when the last portal pointing there is torn down.
+        if (val.__kind === 'portalSlotSlot' && val.target) {
+          unregisterDelegationTarget(val.target);
+        }
       }
     }
   }
@@ -1001,14 +1006,62 @@ interface HandlerBundle {
 }
 type EventSlot = ((event: Event) => any) | HandlerBundle | null | undefined;
 
+// Delegated event names registered by compiled modules' `delegateEvents([...])`
+// calls. Listeners are NOT attached at module-eval time — they're attached to
+// each root container when `createRoot` runs, and to each portal target when
+// the portal mounts. This matches ReactDOM 17+ behaviour: events scoped to
+// the React-owned subtrees, no document-level pollution.
 const _delegated = new Set<string>();
+
+// Active delegation targets (createRoot containers + portal targets). A
+// portal target may host multiple portals; the refcount tracks how many
+// portals are currently rendering into it so we detach only when the last
+// one unmounts. createRoot containers have refcount 1 for their lifetime.
+const _delegationTargets = new Map<Node, number>();
 
 export function delegateEvents(eventNames: string[]): void {
   for (let i = 0; i < eventNames.length; i++) {
     const name = eventNames[i];
     if (_delegated.has(name)) continue;
     _delegated.add(name);
-    document.addEventListener(name, dispatchDelegated);
+    // A new event type was registered after some roots/portals already mounted —
+    // back-attach the listener to every active target so handlers stamped on
+    // their DOM via `el.$$click = …` still receive events.
+    for (const target of _delegationTargets.keys()) {
+      target.addEventListener(name, dispatchDelegated);
+    }
+  }
+}
+
+/**
+ * Register `target` (a createRoot container or a portal target DOM node) as
+ * an event-delegation root. Idempotent w.r.t. each call: first registration
+ * attaches all known delegated event listeners, subsequent registrations
+ * just bump the refcount.
+ */
+function registerDelegationTarget(target: Node): void {
+  const prev = _delegationTargets.get(target) || 0;
+  _delegationTargets.set(target, prev + 1);
+  if (prev === 0) {
+    for (const name of _delegated) {
+      target.addEventListener(name, dispatchDelegated);
+    }
+  }
+}
+
+/**
+ * Inverse of `registerDelegationTarget`. Last referent detaches all listeners.
+ */
+function unregisterDelegationTarget(target: Node): void {
+  const prev = _delegationTargets.get(target);
+  if (!prev) return;
+  if (prev === 1) {
+    _delegationTargets.delete(target);
+    for (const name of _delegated) {
+      target.removeEventListener(name, dispatchDelegated);
+    }
+  } else {
+    _delegationTargets.set(target, prev - 1);
   }
 }
 
@@ -1077,6 +1130,11 @@ export function portal(
     const block = createBlock('portal', parentBlock, target, start, end, body, props);
     state = { __kind: 'portalSlotSlot', block, target, start, end };
     parentScope[slotKey] = state;
+    // Portal target hosts handlers stamped via the same `el.$$click = …`
+    // mechanism as the main tree, so it needs the delegated event listeners
+    // too. Refcounted: a target hosting two portals attaches once, detaches
+    // when the last portal unmounts (see unmountBlock).
+    registerDelegationTarget(target);
     renderBlock(block);
   } else {
     state.block!.body = body;
@@ -2247,6 +2305,10 @@ export interface Root {
 export function createRoot(container: Element): Root {
   let rootBlock: Block | null = null;
   let currentBody: ComponentBody | null = null;
+  // Register the container as an event-delegation target up front. Listeners
+  // for all currently-known delegated events attach now; any new event types
+  // registered later (via `delegateEvents`) will back-attach automatically.
+  registerDelegationTarget(container);
   return {
     render(body, props) {
       if (rootBlock && currentBody === body) {
@@ -2275,6 +2337,7 @@ export function createRoot(container: Element): Root {
         rootBlock = null;
         currentBody = null;
       }
+      unregisterDelegationTarget(container);
     },
   };
 }
