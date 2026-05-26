@@ -103,6 +103,45 @@ function staticObjectToCssString(obj) {
   return parts.join('; ');
 }
 
+function isJsxLike(node) {
+  if (!node) return false;
+  const t = node.type;
+  return t === 'Element' || t === 'Tsrx' || t === 'Tsx' || t === 'Text';
+}
+
+/** A ternary at child position where at least one branch is JSX. */
+function isConditionalJsx(node) {
+  return node
+    && node.type === 'ConditionalExpression'
+    && (isJsxLike(node.consequent) || isJsxLike(node.alternate));
+}
+
+/** Wrap an expression as a BlockStatement body, so makeIfCall can consume it. */
+function wrapAsBlockStmt(node) {
+  if (!node) return null;
+  // null / Literal(null) / Literal(false) → no branch
+  if (node.type === 'Literal' && (node.value === null || node.value === false)) return null;
+  return { type: 'BlockStatement', body: [node] };
+}
+
+/** `xs.map(x => <li/>)` — detect so we can throw a useful "use for-of" error. */
+function isJsxReturningMapCall(node) {
+  if (!node || node.type !== 'CallExpression') return false;
+  const callee = node.callee;
+  if (!callee || callee.type !== 'MemberExpression') return false;
+  if (callee.property?.name !== 'map') return false;
+  const arg = node.arguments?.[0];
+  if (!arg || arg.type !== 'ArrowFunctionExpression') return false;
+  const body = arg.body;
+  if (isJsxLike(body)) return true;
+  if (body && body.type === 'BlockStatement') {
+    for (const stmt of body.body) {
+      if (stmt.type === 'ReturnStatement' && isJsxLike(stmt.argument)) return true;
+    }
+  }
+  return false;
+}
+
 // Recognise the dynamic form `{style (expr)}` — TSRX parses that as a
 // `CallExpression(style, [expr])` because parenthesised expressions don't take
 // the special Style path. We bridge here so both forms behave the same.
@@ -511,6 +550,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
       else ctx.runtimeNeeded.add('setClassName');
     }
     if (b.kind === 'style') ctx.runtimeNeeded.add('setStyle');
+    if (b.kind === 'spread') ctx.runtimeNeeded.add('setSpread');
     mountLines.push(emitBindingMount(b, elVar));
   }
   for (const fc of forCalls) {
@@ -652,6 +692,14 @@ function emitBindingMount(b, elVar) {
       _b._sty$${b.id} = _v;
     }`;
     }
+    case 'spread': {
+      return `    {
+      const _v = ${E};
+      setSpread(${elVar}, _v, undefined);
+      _b._el$${b.id} = ${elVar};
+      _b._sp$${b.id} = _v;
+    }`;
+    }
     case 'event': {
       return `    _b._el$${b.id} = ${elVar};
     ${elVar}.$$${b.eventName} = (${b.expr});`;
@@ -700,6 +748,12 @@ function emitBindingUpdate(b) {
       // reference is unchanged it'd just no-op via the internal diff. We DO
       // skip identity matches to avoid the call overhead.
       return `    { const _v = ${E}; if (_b._sty$${b.id} !== _v) { setStyle(_b._el$${b.id}, _v, _b._sty$${b.id}); _b._sty$${b.id} = _v; } }`;
+    }
+    case 'spread': {
+      // setSpread does its own per-key diffing internally and handles cleanup
+      // of keys that vanished — always call it, but skip if the reference is
+      // identical (the user opted-in to a stable object).
+      return `    { const _v = ${E}; if (_b._sp$${b.id} !== _v) { setSpread(_b._el$${b.id}, _v, _b._sp$${b.id}); _b._sp$${b.id} = _v; } }`;
     }
     case 'event': {
       return `    _b._el$${b.id}.$$${b.eventName} = (${b.expr});`;
@@ -776,18 +830,48 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
 
   // Collect attributes.
   const attrs = node.attributes || node.openingElement?.attributes || [];
+  // React convention: later attributes win on collision. If ANY spread is
+  // present, attributes that come AFTER the first spread can't be inlined
+  // into the template HTML (the spread would clobber them at runtime) —
+  // emit them as bindings in source order instead.
+  const firstSpreadIdx = attrs.findIndex((a) => a.type === 'SpreadAttribute' || a.type === 'JSXSpreadAttribute');
   let attrHtml = '';
-  for (const attr of attrs) {
+  for (let attrI = 0; attrI < attrs.length; attrI++) {
+    const attr = attrs[attrI];
+    // `<div {...props}/>` — runtime spread. Emits one setSpread binding that
+    // routes each key (class / style / on… / attr / ref) and diffs against
+    // the prior spread object to clear removed keys.
+    if (attr.type === 'SpreadAttribute' || attr.type === 'JSXSpreadAttribute') {
+      const expr = printExprWithTsrx(attr.argument, ctx, componentName, inlinedSubs);
+      bindings.push({ id: bindings.length, kind: 'spread', expr, path, ns: hostNs });
+      continue;
+    }
     if (attr.type !== 'Attribute' && attr.type !== 'JSXAttribute') continue;
-    const rawAttrName = attr.name.name || attr.name;
+    // Namespaced attribute names (`xlink:href`) — parser gives us a
+    // JSXNamespacedName { namespace, name } pair. Concatenate so the runtime
+    // sets the literal `xlink:href` attribute (the browser knows the ns).
+    let rawAttrName;
+    if (attr.name && (attr.name.type === 'JSXNamespacedName' || attr.name.type === 'NamespacedName')) {
+      rawAttrName = `${attr.name.namespace.name}:${attr.name.name.name}`;
+    } else {
+      rawAttrName = attr.name.name || attr.name;
+    }
     if (rawAttrName === 'key') continue;  // consumed by for-of, not emitted
     // `className` is React-shape JSX; emit `class` in HTML so the browser
     // actually applies it (and dynamic bindings also know which kind to pick).
     const attrName = rawAttrName === 'className' ? 'class' : rawAttrName;
 
     const val = attr.value;
+    // If this attr comes AFTER a spread, we MUST emit as a binding (later wins).
+    const isAfterSpread = firstSpreadIdx !== -1 && attrI > firstSpreadIdx;
+
     if (val == null) {
-      attrHtml += ` ${attrName}`;
+      if (isAfterSpread) {
+        // Boolean attr after spread → emit as `true` binding.
+        bindings.push({ id: bindings.length, kind: 'attr', name: attrName, expr: 'true', path, ns: hostNs });
+      } else {
+        attrHtml += ` ${attrName}`;
+      }
       continue;
     }
     let inner = val.type === 'JSXExpressionContainer' ? val.expression : val;
@@ -796,13 +880,14 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
     inner = resolveStyleExpr(inner, cssHash);
 
     // `style={...}` — static literal object/string serialises into the HTML
-    // template; dynamic values become a setStyle binding.
+    // template (unless we're after a spread, which would clobber it); dynamic
+    // values become a setStyle binding.
     if (attrName === 'style') {
-      if (inner.type === 'Literal' && typeof inner.value === 'string') {
+      if (!isAfterSpread && inner.type === 'Literal' && typeof inner.value === 'string') {
         attrHtml += ` style="${escapeAttr(inner.value)}"`;
         continue;
       }
-      if (inner.type === 'ObjectExpression' && objectExprIsStaticLiteral(inner)) {
+      if (!isAfterSpread && inner.type === 'ObjectExpression' && objectExprIsStaticLiteral(inner)) {
         const css = staticObjectToCssString(inner);
         if (css) attrHtml += ` style="${escapeAttr(css)}"`;
         continue;
@@ -812,8 +897,9 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
       continue;
     }
 
-    // Static literal value? Inline into HTML.
-    if (inner.type === 'Literal') {
+    // Static literal value? Inline into HTML — UNLESS we're after a spread,
+    // in which case we MUST emit as a binding so source order is preserved.
+    if (inner.type === 'Literal' && !isAfterSpread) {
       if (typeof inner.value === 'string') {
         attrHtml += ` ${attrName}="${escapeAttr(inner.value)}"`;
       } else if (typeof inner.value === 'number') {
@@ -824,7 +910,8 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
       continue;
     }
 
-    // Dynamic value — record a binding.
+    // Dynamic value — record a binding. (Also reached for literal values that
+    // come after a spread, since those need to win over the spread at runtime.)
     const expr = printExprWithTsrx(inner, ctx, componentName, inlinedSubs);
     if (attrName.length > 2 && attrName.startsWith('on') && /^[A-Z]/.test(attrName[2])) {
       const eventName = attrName.slice(2).toLowerCase();
@@ -916,9 +1003,12 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
         );
       } else if (child.type === 'TSRXExpression') {
         // {expr} at JSX child position. Recognised forms:
-        //   - `{ref refExpr}` → ref-attach binding on the host element (TSRX RefExpression)
-        //   - `{createPortal(BODY, TARGET, PROPS?)}` → portal() call (no descriptor alloc)
-        //   - anything else → emit as a text hole (runtime stringifies on render)
+        //   - `{ref refExpr}` → ref-attach binding on the host element
+        //   - `{createPortal(BODY, TARGET, PROPS?)}` → portal() call
+        //   - `{cond ? <JSX/> : <JSX/>}` → lowered to ifBlock (so the branches
+        //      mount real DOM, not stringified text)
+        //   - `{items.map(x => <JSX/>)}` → compile error, point to for-of
+        //   - anything else → emit as a text hole (runtime stringifies)
         const expr = child.expression;
         if (expr && expr.type === 'RefExpression') {
           bindings.push({
@@ -926,10 +1016,29 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
             expr: printExpr(expr.argument),
             path,
           });
-          // No HTML, no markers — the ref binds to the host (parent path).
         } else if (isCreatePortalCall(expr)) {
           const pc = makePortalCall(expr, ctx, componentName, inlinedSubs);
           (ctx._portalCalls ??= []).push(pc);
+        } else if (isConditionalJsx(expr)) {
+          // Lower `{cond ? A : B}` (where A or B is JSX) to an IfStatement so
+          // each branch renders real DOM via the existing ifBlock machinery.
+          const asIf = {
+            type: 'IfStatement',
+            test: expr.test,
+            consequent: wrapAsBlockStmt(expr.consequent),
+            alternate: wrapAsBlockStmt(expr.alternate),
+          };
+          const ic = makeIfCall(asIf, ctx, componentName, inlinedSubs, childNs, cssHash);
+          ic.hostPath = path;
+          ifCalls.push(ic);
+        } else if (isJsxReturningMapCall(expr)) {
+          throw new Error(
+            "`.map()` returning JSX at child position isn't supported in TSRX. " +
+            'Use a for-of loop instead — it gives you keyed reconciliation:\n\n' +
+            '  for (const item of items; key item.id) {\n' +
+            '    <li>{text item.name}</li>\n' +
+            '  }'
+          );
         } else {
           bindings.push({
             id: bindings.length, kind: 'text',
@@ -1042,10 +1151,17 @@ function makeCompCall(node, ctx, componentName, inlinedSubs, bindings, forCalls,
   const id = ctx.nextHelperId++;
   const compExpr = tagExpr(node);
 
-  // Build the props object literal from JSX attributes.
+  // Build the props object literal from JSX attributes. `<Foo {...rest}/>`
+  // becomes a spread element in the object literal — works because component
+  // bodies receive the merged object as `props` and only care about field
+  // values, not identity.
   const attrs = node.attributes || node.openingElement?.attributes || [];
   const propParts = [];
   for (const attr of attrs) {
+    if (attr.type === 'SpreadAttribute' || attr.type === 'JSXSpreadAttribute') {
+      propParts.push(`...(${printExprWithTsrx(attr.argument, ctx, componentName, inlinedSubs)})`);
+      continue;
+    }
     if (attr.type !== 'Attribute' && attr.type !== 'JSXAttribute') continue;
     const attrName = attr.name.name || attr.name;
     const val = attr.value;
@@ -1160,9 +1276,16 @@ function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
 }
 
 function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', cssHash = null) {
-  // node.left = const x, node.right = expr, node.body = BlockStatement,
-  // node.key = optional `key …` expression (TSRX for-of syntax), node.index = optional index identifier.
-  const itemName = node.left.declarations[0].id.name;
+  // node.left = const x  OR  const &{x,y} / const [a,b]  (destructured)
+  // node.right = expr, node.body = BlockStatement,
+  // node.key = optional `key …` expression, node.index = optional `index <id>`.
+  const leftDeclId = node.left.declarations[0].id;
+  const isDestructured = leftDeclId.type !== 'Identifier';
+  // `itemName` is the identifier used in the body signature + keyFn. For a
+  // plain `const x of …`, that's `x`. For a destructured `const &{id} of …`,
+  // we synthesize a fresh name and emit the destructuring inside the body so
+  // the keyFn still gets the whole item and the body still sees the fields.
+  const itemName = isDestructured ? '_item' : leftDeclId.name;
   const itemsExpr = printExpr(node.right);
   const subStmts = node.body.body;
 
@@ -1171,6 +1294,21 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
   //   2. `for (const x of y; key x.id) { ... }` — TSRX for-of header.
   //   3. `for (const x, i of y) { ... }` — second loop param treated as the key.
   //   4. Fallback: `x.id ?? x` (object identity).
+  // Builds `(item) => keyExpr` — when the for-of head is destructured we use
+  // the same destructure pattern as the arg so the user's `key id` (where
+  // `id` is a destructured field) actually resolves.
+  function mkKeyFn(keyExpr) {
+    const param = isDestructured
+      ? leftDeclId
+      : { type: 'Identifier', name: itemName };
+    return printExpr({
+      type: 'ArrowFunctionExpression',
+      params: [param],
+      body: keyExpr,
+      expression: true,
+    });
+  }
+
   let keyFn = null;
   const firstEl = subStmts.find(n => n.type === 'Element');
   if (firstEl) {
@@ -1178,11 +1316,11 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
       .find(a => (a.name?.name || a.name) === 'key');
     if (keyAttr) {
       const inner = keyAttr.value.type === 'JSXExpressionContainer' ? keyAttr.value.expression : keyAttr.value;
-      keyFn = `(${itemName}) => ${printExpr(inner)}`;
+      keyFn = mkKeyFn(inner);
     }
   }
   if (!keyFn && node.key) {
-    keyFn = `(${itemName}) => ${printExpr(node.key)}`;
+    keyFn = mkKeyFn(node.key);
   }
   if (!keyFn && node.index) {
     // Index identifier — caller iterates with index, key by index.
@@ -1194,6 +1332,37 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
   const keyHelper = `_key$${ctx.nextHelperId++}`;
   ctx.hoistedHelpers.push(`const ${keyHelper} = ${keyFn};`);
 
+  // When the for-of header declared `index <name>`, expose it as a `const`
+  // at the top of the body — the runtime stamps `block.itemIndex` per item
+  // on every mount + re-render so the user identifier always reflects the
+  // current position.
+  const indexInjection = node.index ? [{
+    type: 'VariableDeclaration',
+    kind: 'const',
+    declarations: [{
+      type: 'VariableDeclarator',
+      id: { type: 'Identifier', name: node.index.name },
+      init: {
+        type: 'MemberExpression',
+        object: { type: 'Identifier', name: '__block' },
+        property: { type: 'Identifier', name: 'itemIndex' },
+        computed: false,
+      },
+    }],
+  }] : [];
+
+  // Destructured header `const &{x,y} of …` — synthesize a destructure stmt
+  // at the top of the body so the user fields bind from the synthetic item.
+  const destructureInjection = isDestructured ? [{
+    type: 'VariableDeclaration',
+    kind: 'const',
+    declarations: [{
+      type: 'VariableDeclarator',
+      id: leftDeclId,   // ObjectPattern / ArrayPattern (lazy flag dropped by printer)
+      init: { type: 'Identifier', name: itemName },
+    }],
+  }] : [];
+
   // The item body is INLINED inside the parent component body so it captures
   // any locals it references (e.g. `state.selected`, the parent's hook setters).
   // This trades a per-render closure alloc for the per-render flexibility.
@@ -1202,7 +1371,7 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     type: 'Component',
     id: { type: 'Identifier', name: itemHelperName },
     params: [{ type: 'Identifier', name: itemName }],
-    body: subStmts,
+    body: [...indexInjection, ...destructureInjection, ...subStmts],
   };
   const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash);
   inlinedSubs.push(itemFnSource + ';');

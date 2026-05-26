@@ -57,6 +57,9 @@ export interface Block extends Scope {
   disposed: boolean;
   /** Set on item Blocks: pointer to the enclosing for-block's slot. */
   forSlot: ForSlot | null;
+  /** Set on item Blocks when the for-of header declared `index <name>` —
+   *  read at render time so the compiled body can expose it as a const. */
+  itemIndex?: number;
   /**
    * Render priority for the next scheduled render: 'transition' (queued from
    * inside startTransition — suspending shouldn't swap to fallback if prior
@@ -893,6 +896,71 @@ function applyStyleProperty(style: CSSStyleDeclaration, name: string, value: any
 }
 
 // ---------------------------------------------------------------------------
+// Spread attributes — `<div {...props}/>`. Iterates the spread object, routes
+// each key to the appropriate setter (class / style / onXxx / attr / ref) and
+// diffs against the previous spread object so keys that vanished get cleared.
+// React 19 shape; only `key`, `ref`, `children` are special-cased.
+// ---------------------------------------------------------------------------
+
+function isEventKey(k: string): boolean {
+  const c = k.charCodeAt(2);
+  return k.length > 2 && k.charCodeAt(0) === 111 /*o*/ && k.charCodeAt(1) === 110 /*n*/
+    && c >= 65 /*A*/ && c <= 90 /*Z*/;
+}
+
+export function setSpread(el: Element, value: any, prev: any): void {
+  // Remove keys present in prev but absent (or set differently for events) in value.
+  if (prev) {
+    for (const k in prev) {
+      if (k === 'key' || k === 'children' || k === 'ref') continue;
+      if (value && k in value) continue;
+      if (isEventKey(k)) {
+        (el as any)['$$' + k.slice(2).toLowerCase()] = null;
+      } else if (k === 'class' || k === 'className') {
+        el.removeAttribute('class');
+      } else if (k === 'style') {
+        setStyle(el as HTMLElement, null, prev[k]);
+      } else {
+        el.removeAttribute(k);
+      }
+    }
+  }
+  if (value == null) return;
+  for (const k in value) {
+    if (k === 'key' || k === 'children') continue;
+    const v = value[k];
+    const pv = prev ? prev[k] : undefined;
+    if (k === 'ref') {
+      if (v === pv) continue;
+      if (typeof v === 'function') v(el);
+      else if (v != null) (v as any).current = el;
+      continue;
+    }
+    if (k === 'class' || k === 'className') {
+      if (v === pv) continue;
+      if (v == null || v === false) el.removeAttribute('class');
+      else el.setAttribute('class', v === true ? '' : String(v));
+      continue;
+    }
+    if (k === 'style') {
+      setStyle(el as HTMLElement, v, pv);
+      continue;
+    }
+    if (isEventKey(k)) {
+      if (v === pv) continue;
+      const evName = k.slice(2).toLowerCase();
+      // Lazy-delegate any event we haven't seen — the compiler can't predict
+      // event names that arrive dynamically through spread.
+      if (!_delegated.has(evName)) delegateEvents([evName]);
+      (el as any)['$$' + evName] = v;
+      continue;
+    }
+    if (v === pv) continue;
+    setAttribute(el, k, v);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Component-scoped <style> injection — idempotent, keyed by the compiled
 // stylesheet hash so repeated mounts (or HMR re-imports) inject once.
 // ---------------------------------------------------------------------------
@@ -1665,7 +1733,7 @@ function reconcileKeyed<T, E>(
     for (let i = 0; i < newLen; i++) {
       const item = items[i];
       const key = getKey(item, i);
-      const block = mountItem(parentBlock, parentNode, state.end, item, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state);
       oldItems.set(key, block);
       newOrder[i] = key;
     }
@@ -1691,6 +1759,7 @@ function reconcileKeyed<T, E>(
     block.props = items[prefixLen];
     block.extra = extra;
     block.body = itemBody as ComponentBody;
+    block.itemIndex = prefixLen;
     renderBlock(block);
     prefixLen++;
   }
@@ -1711,6 +1780,7 @@ function reconcileKeyed<T, E>(
     block.props = items[newEnd];
     block.extra = extra;
     block.body = itemBody as ComponentBody;
+    block.itemIndex = newEnd;
     renderBlock(block);
     oldEnd--;
     newEnd--;
@@ -1727,7 +1797,7 @@ function reconcileKeyed<T, E>(
     for (let i = prefixLen; i <= newEnd; i++) {
       const item = items[i];
       const key = getKey(item, i);
-      const block = mountItem(parentBlock, parentNode, anchor, item, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, anchor, item, i, itemBody, extra, state);
       oldItems.set(key, block);
       newOrder.push(key);
     }
@@ -1779,7 +1849,7 @@ function reconcileKeyed<T, E>(
     for (let i = 0; i < newLen; i++) {
       const item = items[i];
       const key = newKeys[i];
-      const block = mountItem(parentBlock, parentNode, state.end, item, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state);
       oldItems.set(key, block);
       newOrder[i] = key;
     }
@@ -1813,6 +1883,7 @@ function reconcileKeyed<T, E>(
       block.props = items[newIdx];
       block.extra = extra;
       block.body = itemBody as ComponentBody;
+      block.itemIndex = newIdx;
       renderBlock(block);
     }
   }
@@ -1841,7 +1912,7 @@ function reconcileKeyed<T, E>(
       if (sources[i] === -1) {
         // New item — mount it.
         const item = items[targetIdx];
-        const block = mountItem(parentBlock, parentNode, anchor, item, itemBody, extra, state);
+        const block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state);
         oldItems.set(key, block);
       } else if (seqIdx < 0 || i !== seq[seqIdx]) {
         // Moved — relocate the DOM range before the anchor.
@@ -1860,7 +1931,7 @@ function reconcileKeyed<T, E>(
       const anchor: Node = nextItem ? nextItem.startMarker! : middleAnchor;
       const key = newKeys[i];
       const item = items[targetIdx];
-      const block = mountItem(parentBlock, parentNode, anchor, item, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state);
       oldItems.set(key, block);
     }
   }
@@ -1909,6 +1980,7 @@ function mountItem<T, E>(
   parentNode: Node,
   anchor: Node,
   item: T,
+  index: number,
   body: (s: Scope, item: T, extra: E) => void,
   extra: E,
   forSlot: ForSlot,
@@ -1919,6 +1991,7 @@ function mountItem<T, E>(
   parentNode.insertBefore(end, anchor);
   const block = createBlock('control-flow', parentBlock, parentNode, start, end, body as ComponentBody, item, extra);
   block.forSlot = forSlot;
+  block.itemIndex = index;
   renderBlock(block);
   return block;
 }

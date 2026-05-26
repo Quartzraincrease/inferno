@@ -37,6 +37,7 @@ export {
   setAttribute,
   setClassName,
   setStyle,
+  setSpread,
   injectStyle,
   delegateEvents,
   forBlock,
