@@ -149,6 +149,131 @@ function collectComponentLocals(componentNode) {
 }
 
 /**
+ * Compute the set of component-local names that are guaranteed STABLE across
+ * renders. Used by the auto-callback pass below to decide which `const X =
+ * (...) => ...` declarations can be lowered to `useCallback`, and by the
+ * for-of dep-snapshot logic to know whether a captured closure is worth
+ * memoising on.
+ *
+ * Stability sources:
+ *   - useState / useReducer setters (second destructured slot)
+ *   - useRef returns (the ref object itself, not .current)
+ *   - useCallback / useEffectEvent returns
+ *   - Arrows previously declared in this body whose free vars are themselves
+ *     all stable — transitive (auto-callback adds them back into the set)
+ *
+ * Walked in source order so a later `const` can reference an earlier one's
+ * stability. Anything we can't prove stable is left out and re-renders
+ * normally.
+ */
+function computeStableLocals(statements, componentLocals) {
+  const stable = new Set();
+  for (const stmt of statements) {
+    if (stmt.type !== 'VariableDeclaration') continue;
+    for (const decl of stmt.declarations || []) {
+      const init = decl.init;
+      if (!init) continue;
+      if (init.type === 'CallExpression' && init.callee && init.callee.type === 'Identifier') {
+        const callName = init.callee.name;
+        // [_, setX] = useState(...)  — second slot is the stable setter.
+        // Same shape for useReducer's dispatch.
+        if ((callName === 'useState' || callName === 'useReducer')
+            && decl.id.type === 'ArrayPattern'
+            && decl.id.elements
+            && decl.id.elements.length >= 2
+            && decl.id.elements[1]
+            && decl.id.elements[1].type === 'Identifier') {
+          stable.add(decl.id.elements[1].name);
+          continue;
+        }
+        // x = useRef(...) / useCallback(...) / useEffectEvent(...) — the
+        // return value is stable for the lifetime of the component.
+        if ((callName === 'useRef' || callName === 'useCallback' || callName === 'useEffectEvent')
+            && decl.id.type === 'Identifier') {
+          stable.add(decl.id.name);
+          continue;
+        }
+      }
+      if (init.type === 'ArrowFunctionExpression' && decl.id.type === 'Identifier') {
+        if (isArrowStableOver(init, stable, componentLocals)) {
+          stable.add(decl.id.name);
+        }
+      }
+    }
+  }
+  return stable;
+}
+
+/**
+ * An arrow is "stable" when every free variable it references is either:
+ *   - already known stable in this component (state setter / ref / ...)
+ *   - not a component local at all (module-level — imports, top-level fns,
+ *     literals — assumed stable by the React-convention rule that mutable
+ *     state belongs in hooks, not in module scope)
+ */
+function isArrowStableOver(arrow, stable, componentLocals) {
+  const paramScope = new Set();
+  for (const p of arrow.params || []) collectBindings(p, paramScope);
+  const free = collectFreeIdentifiers(arrow.body, paramScope);
+  for (const name of free) {
+    if (!componentLocals.has(name)) continue;   // module-level
+    if (stable.has(name)) continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Rewrite a VariableDeclaration so that any declarator initialised with an
+ * arrow whose name is in `stable` becomes `useCallback(arrow, [deps])`.
+ * `deps` is the subset of the arrow's free vars that are component locals
+ * (module-level identifiers don't need to be listed — useCallback only cares
+ * about reactive deps).
+ *
+ * Idempotent: a const we already rewrote into `useCallback(...)` won't be
+ * re-wrapped (its init is now a CallExpression, not an ArrowFunctionExpression).
+ */
+function rewriteAutoCallback(stmt, stable, componentLocals, ctx) {
+  if (stmt.type !== 'VariableDeclaration' || stmt.kind !== 'const') return stmt;
+  let modified = false;
+  const newDecls = stmt.declarations.map(decl => {
+    if (!decl.init || decl.init.type !== 'ArrowFunctionExpression') return decl;
+    if (decl.id.type !== 'Identifier') return decl;
+    if (!stable.has(decl.id.name)) return decl;
+
+    const arrow = decl.init;
+    const paramScope = new Set();
+    for (const p of arrow.params || []) collectBindings(p, paramScope);
+    const free = collectFreeIdentifiers(arrow.body, paramScope);
+    const deps = [];
+    const seen = new Set();
+    for (const name of free) {
+      if (!componentLocals.has(name)) continue;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      deps.push(name);
+    }
+    modified = true;
+    ctx.runtimeNeeded.add('useCallback');
+    return {
+      ...decl,
+      init: {
+        type: 'CallExpression',
+        callee: { type: 'Identifier', name: 'useCallback' },
+        arguments: [
+          arrow,
+          {
+            type: 'ArrayExpression',
+            elements: deps.map(n => ({ type: 'Identifier', name: n })),
+          },
+        ],
+      },
+    };
+  });
+  return modified ? { ...stmt, declarations: newDecls } : stmt;
+}
+
+/**
  * Walk an AST subtree collecting Identifier references that are NOT bound
  * locally (inside the subtree). Tracks block/function scopes so inner `const`
  * declarations correctly shadow outer references.
@@ -494,7 +619,11 @@ function compileComponent(node, ctx) {
   ctx.currentComponentLocals = collectComponentLocals(node);
   let fn;
   try {
-    fn = compileFunctionBody(node, ctx, name, 'html', cssHash);
+    // autoCallback: only top-level component bodies opt in. Item bodies and
+    // other inner compileFunctionBody calls leave their arrows untouched
+    // (they rarely declare arrow consts; if they do, the stability oracle
+    // would need to be redefined relative to the inner scope).
+    fn = compileFunctionBody(node, ctx, name, 'html', cssHash, { autoCallback: true });
   } finally {
     ctx.currentComponentLocals = prevLocals;
   }
@@ -519,7 +648,7 @@ function compileComponent(node, ctx) {
  * `cssHash` is the enclosing component's scoped-style hash (or null) — used to
  * resolve `{style 'cls'}` expressions to "<hash> cls" strings.
  */
-function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null) {
+function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null, options = null) {
   const params = node.params.map(p => printNode(p)).join(', ');
   const paramsClause = params ? `, ${params}` : '';
 
@@ -544,12 +673,24 @@ function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null)
   // INSIDE this function body (so for-of item bodies can capture parent state).
   const inlinedSubs = [];
 
+  // Auto-callback: lower `const X = (...) => ...` to `useCallback(X, [deps])`
+  // for arrows whose free vars are all stable. Only runs at the component-body
+  // level (caller opts in via options.autoCallback). For-of item bodies and
+  // other inner compileFunctionBody calls skip this — they rarely declare
+  // arrow consts, and the stability oracle is defined relative to the
+  // component's scope, not the item body's.
+  let workingStatements = statements;
+  if (options && options.autoCallback && ctx.currentComponentLocals) {
+    const stableSet = computeStableLocals(statements, ctx.currentComponentLocals);
+    workingStatements = statements.map(s => rewriteAutoCallback(s, stableSet, ctx.currentComponentLocals, ctx));
+  }
+
   // Rewrite hook calls and `<tsrx>` blocks in statements before printing them.
   // A `<tsrx>` block at expression position (e.g. `const f = <tsrx>...</tsrx>`)
   // is hoisted as a render function in inlinedSubs and replaced with an
   // identifier reference. Suitable for top-level render-prop patterns where
   // the block doesn't capture local arrow params.
-  const rewrittenStatements = statements
+  const rewrittenStatements = workingStatements
     .map(s => rewriteHookCalls(s, ctx, name))
     .map(s => rewriteTsrxBlocks(s, ctx, name, inlinedSubs));
   const statementCode = rewrittenStatements.map(s => '  ' + printNode(s).replace(/\n/g, '\n  ')).join('\n');
@@ -557,6 +698,11 @@ function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null)
   const plan = planJsx(jsxNodes, ctx, name, inlinedSubs, parentNs, cssHash);
 
   const lines = [];
+  // Closure-dep snapshot prologue (raw JS string). Used by impure for-of item
+  // bodies that close over parent locals but have no hooks / no component
+  // calls / no control flow — they can short-circuit when every captured
+  // value (deps + item ref) matches the previous render.
+  if (options && options.prologue) lines.push(options.prologue);
   if (statementCode) lines.push(statementCode);
   if (inlinedSubs.length > 0) lines.push(inlinedSubs.map(s => '  ' + s.replace(/\n/g, '\n  ')).join('\n'));
   if (plan.bindingsName) {
@@ -1639,9 +1785,83 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     }],
   }] : [];
 
+  // ─── Body analysis: pure / dep-memo / single-root.
+  //
+  // Three escalating fast paths the runtime can take per row:
+  //   1. PURE: body closes over nothing parent-reactive, no hooks, no comps,
+  //      no control flow → reconciler skips renderBlock when item ref + index
+  //      unchanged. Identified by `pure = true`.
+  //   2. DEP-MEMO: body DOES close over parent locals but otherwise as clean
+  //      as PURE (no hooks, no comps, no control flow). Body itself runs but
+  //      short-circuits via a `__block.deps` snapshot check at the prologue.
+  //      Identified by `depNames.length > 0` AND `depMemoEligible`.
+  //   3. NORMAL: anything else → body runs every render, per-binding diffs do
+  //      the change detection.
+  // The analysis must run BEFORE compileFunctionBody (we pass the prologue
+  // in), but uses only AST inspection — no compiler side effects to worry
+  // about ordering against.
+  let pure = false;
+  const depNames = [];
+  let depMemoEligible = false;
+  if (ctx.currentComponentLocals) {
+    const bodyScope = new Set([itemName]);
+    if (node.index) bodyScope.add(node.index.name);
+    const bodyAst = { type: 'BlockStatement', body: subStmts };
+    const free = collectFreeIdentifiers(bodyAst, bodyScope);
+    let hasParentClosure = false;
+    let hasHook = false;
+    const seenDeps = new Set();
+    for (const name of free) {
+      if (HOOK_NAMES.has(name) || name === 'use') { hasHook = true; }
+      if (ctx.currentComponentLocals.has(name)) {
+        hasParentClosure = true;
+        if (!seenDeps.has(name)) { seenDeps.add(name); depNames.push(name); }
+      }
+    }
+    const hasNestedComp = containsComponentCallOrControlFlow(subStmts);
+    // PURE: nothing from parent, no hooks, no comps/control-flow.
+    pure = !hasParentClosure && !hasHook && !hasNestedComp;
+    // DEP-MEMO: parent closures present, but the same hook/comp/control-flow
+    // exclusions as PURE. We pre-evaluate each dep at the top of the body
+    // and skip the rest of the body if all match the previous snapshot.
+    depMemoEligible = !pure && hasParentClosure && !hasHook && !hasNestedComp;
+    // Deterministic order so emitted code is stable across compiles.
+    depNames.sort();
+  }
+
   // The item body is INLINED inside the parent component body so it captures
   // any locals it references (e.g. `state.selected`, the parent's hook setters).
   // This trades a per-render closure alloc for the per-render flexibility.
+  //
+  // For DEP-MEMO bodies, the prologue (raw JS) is prepended inside the item
+  // function: snapshot the closure deps + item + itemIndex into `__block.deps`
+  // and short-circuit on identity match. The reconciler still calls render
+  // for impure bodies — the savings come from the body returning before any
+  // binding-update or DOM work runs.
+  let prologue = '';
+  if (depMemoEligible) {
+    // Slot order: [parent-local closures..., item ref, itemIndex].
+    // itemIndex is included unconditionally so position changes (e.g. middle
+    // reorders) re-render even when item ref + closures are unchanged —
+    // matches the existing pure-memo check.
+    const slots = depNames.map(n => `(${n})`);
+    slots.push(`(${itemName})`);
+    slots.push('__block.itemIndex');
+    const declParts = slots.map((e, i) => `_d${i} = ${e}`).join(', ');
+    const checks = slots.map((_, i) => `_ds[${i}] === _d${i}`).join(' && ');
+    const writes = slots.map((_, i) => `_ds[${i}] = _d${i};`).join(' ');
+    const initArr = slots.map((_, i) => `_d${i}`).join(', ');
+    prologue =
+`  const ${declParts};
+  const _ds = __block.deps;
+  if (_ds !== null) {
+    if (${checks}) return;
+    ${writes}
+  } else {
+    __block.deps = [${initArr}];
+  }`;
+  }
+
   const itemHelperName = `__item$${ctx.nextHelperId++}`;
   const fakeComponent = {
     type: 'Component',
@@ -1649,36 +1869,8 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     params: [{ type: 'Identifier', name: itemName }],
     body: [...indexInjection, ...destructureInjection, ...subStmts],
   };
-  const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash);
+  const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash, { prologue });
   inlinedSubs.push(itemFnSource + ';');
-
-  // Purity check — if the body references nothing from the enclosing
-  // component's outer locals (only the item, locals it declares itself,
-  // imports, and globals) AND uses no hooks (which read dynamic state like
-  // context, refs, state setters), the runtime can SKIP re-rendering
-  // survivors whose item ref + index are unchanged. That's the auto-memo
-  // path: it lets keyed reorders (swap, etc.) avoid wasted work on the 99%
-  // of rows that didn't change. Bodies that close over parent state OR call
-  // hooks are correctly identified as impure and re-render normally.
-  let pure = false;
-  if (ctx.currentComponentLocals) {
-    const bodyScope = new Set([itemName]);
-    if (node.index) bodyScope.add(node.index.name);
-    const bodyAst = { type: 'BlockStatement', body: subStmts };
-    const free = collectFreeIdentifiers(bodyAst, bodyScope);
-    pure = true;
-    for (const name of free) {
-      if (ctx.currentComponentLocals.has(name)) { pure = false; break; }
-      // Hooks (use, useState, useEffect, …) read dynamic state — their
-      // results can change across renders without the item changing.
-      if (HOOK_NAMES.has(name) || name === 'use') { pure = false; break; }
-    }
-    // Component calls inside the body (e.g. `<Foo />`) may read context or
-    // other dynamic state during their own render — skipping the parent
-    // re-render would skip them too, so we can't safely memo. Same for
-    // top-level if/for/try (they can wrap component calls transitively).
-    if (pure && containsComponentCallOrControlFlow(subStmts)) pure = false;
-  }
 
   // Single-root detection: when the body emits exactly one Element root and
   // no other JSX siblings (no Fragment, no Component, no top-level if/for/try),

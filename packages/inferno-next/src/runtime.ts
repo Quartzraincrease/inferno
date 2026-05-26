@@ -72,6 +72,19 @@ export interface Block extends Scope {
   /** Cached key for this item Block. null on non-item blocks. */
   key: any;
   /**
+   * Closure-dep snapshot for impure for-of bodies. When the body is "impure"
+   * (closes over parent locals) but otherwise safe to skip (no hooks, no
+   * component calls, no control flow), the compiler emits a prologue that
+   * snapshots the parent locals + item into this array. On subsequent calls,
+   * if every captured value matches the snapshot, the body returns early —
+   * its DOM is already correct.
+   *
+   * null on first render (then promoted to an Array of the captured values)
+   * and on blocks whose body opted out of dep-memoing. Kept as a single
+   * field so the snapshot's length is implicit in the array's `.length`.
+   */
+  deps: any[] | null;
+  /**
    * Render priority for the next scheduled render: 'transition' (queued from
    * inside startTransition — suspending shouldn't swap to fallback if prior
    * UI is committed) or 'urgent' (default). Read & cleared when the render
@@ -374,6 +387,7 @@ export function createBlock(
     prevSibling: null,
     nextSibling: null,
     key: null,
+    deps: null,
     pendingMode: null,
     currentRenderMode: null,
     parent: null,
