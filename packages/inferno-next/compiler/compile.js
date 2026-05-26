@@ -676,7 +676,14 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   const forCalls = [];          // forBlock calls — emitted after the mount/append
   const ifCalls = [];           // ifBlock calls
   const compCalls = [];         // component-as-tag calls (<Provider>, <Foo/>, <ctx.X/>)
-  ctx._portalCalls = [];        // {createPortal(...)} calls (collected per-plan)
+  // {createPortal(...)} calls collected by emitElementHtml for THIS plan.
+  // Save/restore the previous list across the plan so that nested planJsx
+  // calls (triggered by compiling portal bodies via printExprWithTsrx) don't
+  // wipe the outer plan's collected portals. Without this, two sibling
+  // createPortal calls at the same level lose the first one because the
+  // recursive plan for its body resets the array before the second push.
+  const _prevPortalCalls = ctx._portalCalls;
+  ctx._portalCalls = [];
   const tryCalls = [];          // tryBlock calls
 
   // Track HTML index across top-level nodes — component-call nodes don't
@@ -786,6 +793,14 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
     tc.elVar = elVar;
     mountLines.push(`    _b._tryHost$${tc.id} = ${elVar};`);
   }
+  // Portal host targets — element containing the createPortal JSX position.
+  // Stashed so the runtime can stamp $$portalParent on the portal's mounted
+  // children pointing here, giving React-shape bubble-out semantics.
+  for (const pc of ctx._portalCalls) {
+    const elVar = ensureVar(pc.hostPath || []);
+    pc.elVar = elVar;
+    mountLines.push(`    _b._portalHost$${pc.id} = ${elVar};`);
+  }
 
   if (!noTemplate) {
     if (single) {
@@ -828,9 +843,10 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   }
   for (const pc of ctx._portalCalls) {
     ctx.runtimeNeeded.add('portal');
-    afterLines.push(`  portal(__s, ${JSON.stringify('_portal$' + pc.id)}, ${pc.targetExpr}, ${pc.bodyExpr}, ${pc.propsExpr});`);
+    afterLines.push(`  portal(__s, ${JSON.stringify('_portal$' + pc.id)}, ${pc.targetExpr}, ${pc.bodyExpr}, ${pc.propsExpr}, __s.${bindingsName}._portalHost$${pc.id});`);
   }
-  ctx._portalCalls = [];
+  // Restore the outer plan's portal-call list — pairs with the save above.
+  ctx._portalCalls = _prevPortalCalls;
   for (const tc of tryCalls) {
     ctx.runtimeNeeded.add('tryBlock');
     afterLines.push(`  tryBlock(__s, ${JSON.stringify('_try$' + tc.id)}, __s.${bindingsName}._tryHost$${tc.id}, ${tc.tryHelper}, ${tc.catchHelper}, ${tc.pendingHelper});`);
@@ -1273,6 +1289,11 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
           });
         } else if (isCreatePortalCall(expr)) {
           const pc = makePortalCall(expr, ctx, componentName, inlinedSubs);
+          // Stash the JSX-tree host (the element containing this createPortal
+          // call) so the runtime can stamp $$portalParent on portal children
+          // pointing back at it. That makes events bubble OUT of the portal
+          // up through this element — matching React's per-fiber portal walk.
+          pc.hostPath = path;
           (ctx._portalCalls ??= []).push(pc);
         } else if (isConditionalJsx(expr)) {
           // Lower `{cond ? A : B}` (where A or B is JSX) to an IfStatement so

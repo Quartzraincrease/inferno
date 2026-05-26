@@ -1119,6 +1119,7 @@ export function portal(
   target: Element,
   body: ComponentBody,
   props: any,
+  host?: Node,
 ): void {
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as PortalSlot | undefined;
@@ -1140,6 +1141,23 @@ export function portal(
     state.block!.body = body;
     state.block!.props = props;
     renderBlock(state.block!);
+  }
+  // Stamp `$$portalParent` on every direct child the portal placed between
+  // its start/end markers. The dispatcher reads this when bubbling up: on
+  // reaching a stamped node it jumps to the logical parent's DOM context
+  // instead of continuing into the portal target's natural ancestors. This
+  // mirrors React's per-fiber portal walk so a click inside a modal bubbles
+  // up through the React tree, not just the document.body subtree.
+  //
+  // `host` (passed by the compiler) is the JSX element that contains the
+  // createPortal call — the natural "logical parent" for event bubbling.
+  // When the portal is at top level (no enclosing element) the compiler
+  // passes the enclosing block's parentNode instead.
+  const logicalParent = host || parentBlock.parentNode;
+  let n: ChildNode | null = state.start!.nextSibling;
+  while (n !== null && n !== state.end) {
+    (n as any).$$portalParent = logicalParent;
+    n = n.nextSibling;
   }
 }
 
