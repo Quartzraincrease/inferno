@@ -35,7 +35,7 @@ const VOID_ELEMENTS = new Set([
 const HOOK_NAMES = new Set([
   'useState', 'useReducer', 'useEffect', 'useLayoutEffect', 'useInsertionEffect',
   'useMemo', 'useCallback', 'useRef', 'useId', 'useEffectEvent', 'useImperativeHandle',
-  'useDeferredValue',
+  'useDeferredValue', 'useTransition',
 ]);
 
 // Namespace inheritance — mirrors HTML5 foreign-content rules. The element

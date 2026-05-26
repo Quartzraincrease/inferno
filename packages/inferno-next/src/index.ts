@@ -21,6 +21,8 @@ export {
   useImperativeHandle,
   useEffectEvent,
   useDeferredValue,
+  useTransition,
+  startTransition,
 
   // Context
   createContext,

@@ -57,6 +57,15 @@ export interface Block extends Scope {
   disposed: boolean;
   /** Set on item Blocks: pointer to the enclosing for-block's slot. */
   forSlot: ForSlot | null;
+  /**
+   * Render priority for the next scheduled render: 'transition' (queued from
+   * inside startTransition — suspending shouldn't swap to fallback if prior
+   * UI is committed) or 'urgent' (default). Read & cleared when the render
+   * is dispatched.
+   */
+  pendingMode?: 'urgent' | 'transition';
+  /** The render mode in effect during the body's *current* execution. */
+  currentRenderMode?: 'urgent' | 'transition';
 }
 
 interface EffectSlot {
@@ -94,6 +103,29 @@ let scheduled = false;
 let flushDepth = 0;       // re-entrancy guard for setters fired during render
 let syncFlush = false;    // flushSync sets this to drain the queue synchronously
 
+// ---------------------------------------------------------------------------
+// Transitions — React 18 priority lanes, simplified to two levels.
+// ---------------------------------------------------------------------------
+
+/** Depth of nested startTransition() calls currently on the call stack. */
+let TRANSITION_DEPTH = 0;
+/**
+ * Outstanding transition WORK count — incremented when startTransition fires,
+ * decremented when its renders commit (and again for any tryBlock that holds
+ * the transition pending while suspended). useTransition's isPending tracks
+ * this via TRANSITION_LISTENERS.
+ */
+let TRANSITION_PENDING_COUNT = 0;
+const TRANSITION_LISTENERS = new Set<() => void>();
+
+function tickTransitionCount(delta: number): void {
+  TRANSITION_PENDING_COUNT += delta;
+  if (TRANSITION_PENDING_COUNT < 0) TRANSITION_PENDING_COUNT = 0;
+  for (const fn of TRANSITION_LISTENERS) {
+    try { fn(); } catch (err) { console.error(err); }
+  }
+}
+
 const INSERTION = 0, LAYOUT = 1, PASSIVE = 2;
 type Phase = 0 | 1 | 2;
 
@@ -101,8 +133,17 @@ const effectQueues: [PendingEffect[], PendingEffect[], PendingEffect[]] = [[], [
 let passiveScheduled = false;
 
 export function scheduleRender(block: Block): void {
-  if (block.disposed || block.pending) return;
+  if (block.disposed) return;
+  // Capture the caller's priority — setters inside startTransition() see
+  // TRANSITION_DEPTH > 0 and tag the render as 'transition'. An urgent setter
+  // arriving for a block already queued at 'transition' upgrades it.
+  const mode: 'urgent' | 'transition' = TRANSITION_DEPTH > 0 ? 'transition' : 'urgent';
+  if (block.pending) {
+    if (mode === 'urgent') block.pendingMode = 'urgent';
+    return;
+  }
   block.pending = true;
+  block.pendingMode = mode;
   QUEUE.push(block);
   if (syncFlush) return;
   if (!scheduled) {
@@ -335,6 +376,12 @@ export function renderBlock(block: Block): void {
   // in __thenables persist so that earlier use() calls return synchronously
   // on replay-after-resolve (matches React's thenableState[index] scheme).
   (block as any).__thenableIdx = 0;
+  // Capture the render priority. Explicit pendingMode (set by scheduleRender)
+  // wins. Otherwise INHERIT from the outer block — re-entrant renders (try,
+  // if, for, comp slots) called synchronously inside an outer body should
+  // run at the outer body's priority so transitions propagate down naturally.
+  block.currentRenderMode = block.pendingMode ?? prevBlock?.currentRenderMode ?? 'urgent';
+  block.pendingMode = undefined;
   try {
     block.body(block, block.props, block.extra);
     if (!block.mounted) block.mounted = true;
@@ -1062,6 +1109,12 @@ interface TrySlot {
   err: any;
   /** The thenable we're currently waiting on (so duplicate listeners don't fire). */
   pendingThenable: TrackedThenable<any> | null;
+  /**
+   * True if a transition-priority render suspended on this try block AND we
+   * incremented TRANSITION_PENDING_COUNT to keep useTransition's isPending
+   * latched true. Released when the suspended thenable resolves (in retry).
+   */
+  transitionHeld: boolean;
   domParent: Node;
   parentBlock: Block;
 }
@@ -1087,6 +1140,7 @@ export function tryBlock(
       tryBody, catchBody, pendingBody,
       hasResolved: false,
       err: null, pendingThenable: null,
+      transitionHeld: false,
       domParent, parentBlock,
     };
     parentScope[slotKey] = newState;
@@ -1111,6 +1165,13 @@ export function tryBlock(
     s.tryBlock.body = s.tryBody;
     try {
       renderBlock(s.tryBlock);
+      // Successful commit — this supersedes any in-flight transition
+      // suspended on this slot. Release the held transition counter and
+      // invalidate the pending retry so the eventual .then callback no-ops.
+      // Matches React's "urgent setState while transition is suspended
+      // discards the transition" semantics (ReactUse-test.js:1631).
+      releaseHeldTransition(s);
+      s.pendingThenable = null;
     } catch (err) {
       if (isSuspenseException(err)) handleSuspense(s, err.thenable, s.tryBlock);
       else switchToCatch(s, err);
@@ -1193,16 +1254,43 @@ function reattachTryBlock(state: TrySlot): void {
   state.savedDom = null;
 }
 
+/**
+ * Decrement the transition counter we held open during a suspended transition.
+ * Called from any path where the transition is now resolved or superseded.
+ * No-op if no hold is currently held.
+ */
+function releaseHeldTransition(state: TrySlot): void {
+  if (state.transitionHeld) {
+    state.transitionHeld = false;
+    tickTransitionCount(-1);
+  }
+}
+
 function handleSuspense(
   state: TrySlot,
   thenable: TrackedThenable<any>,
   sourceBlock: Block,
 ): void {
+  // Transition-priority suspends on an ALREADY-committed try block keep the
+  // prior DOM visible — matches React's `useTransition` contract that the
+  // previous screen stays mounted until the new tree is fully ready. We also
+  // hold the transition counter open until the suspended render resumes, so
+  // `useTransition`'s isPending stays true the whole time.
+  const isTransition = sourceBlock.currentRenderMode === 'transition';
+  if (isTransition && state.hasResolved && sourceBlock === state.tryBlock) {
+    if (!state.transitionHeld) {
+      state.transitionHeld = true;
+      tickTransitionCount(+1);
+    }
+    attachResume(state, thenable);
+    return;
+  }
+
   if (sourceBlock === state.tryBlock) {
-    // The try-body block itself suspended (initial render OR re-render).
-    // PRESERVE its hooks Map and `_b.*` bindings so useMemo/useState etc.
-    // survive across replays — matches React's WIP-discard contract where
-    // even an unfinished render's hook state is committed for replay.
+    // Urgent suspend on the try-body block itself (initial render OR
+    // re-render). PRESERVE its hooks Map and `_b.*` bindings so useMemo /
+    // useState etc. survive across replays — matches React's WIP-discard
+    // contract where even an unfinished render's hook state is preserved.
     softDetachTryBlock(state);
   } else {
     // Nested-block suspended — pop the whole try subtree. (Rare in current
@@ -1241,39 +1329,101 @@ function attachResume(state: TrySlot, thenable: TrackedThenable<any>): void {
   const retry = () => {
     if (state.pendingThenable !== thenable) return;  // superseded by a fresher suspend
     state.pendingThenable = null;
-    // If we preserved the try block via softDetach (initial suspend OR
-    // re-render suspend), reattach + re-render in place — hooks state is
-    // intact so useMemo/useState etc. don't re-run. Otherwise mount fresh
-    // (e.g. after catch reset).
-    if (state.tryBlock && state.savedDom && !state.tryBlock.disposed) {
-      if (state.block && state.block !== state.tryBlock) {
-        unmountBlock(state.block);
-        state.block = null;
+    // Release any transition counter we held open during the suspension. If
+    // the retry re-suspends within the same transition, handleSuspense will
+    // re-acquire the hold — net count unchanged, no isPending flicker.
+    const wasHeld = state.transitionHeld;
+    if (wasHeld) state.transitionHeld = false;
+    try {
+      if (state.tryBlock && !state.tryBlock.disposed) {
+        if (state.savedDom) {
+          if (state.block && state.block !== state.tryBlock) {
+            unmountBlock(state.block);
+            state.block = null;
+          }
+          reattachTryBlock(state);
+        }
+        state.block = state.tryBlock;
+        state.branch = 1;
+        state.tryBlock.body = state.tryBody;
+        // Preserve transition priority on the retry render — the retry is a
+        // continuation of the same transition, so a re-suspend on a different
+        // promise should also keep the prior DOM (and isPending stays true).
+        if (wasHeld) state.tryBlock.pendingMode = 'transition';
+        try {
+          renderBlock(state.tryBlock);
+          state.hasResolved = true;
+        } catch (err) {
+          if (isSuspenseException(err)) handleSuspense(state, err.thenable, state.tryBlock!);
+          else switchToCatch(state, err);
+        }
+      } else {
+        mountTry(state);
       }
-      reattachTryBlock(state);
-      state.block = state.tryBlock;
-      state.branch = 1;
-      state.tryBlock.body = state.tryBody;
-      try {
-        renderBlock(state.tryBlock);
-        state.hasResolved = true;
-      } catch (err) {
-        if (isSuspenseException(err)) handleSuspense(state, err.thenable, state.tryBlock!);
-        else switchToCatch(state, err);
-      }
-    } else {
-      mountTry(state);
+    } finally {
+      if (wasHeld) tickTransitionCount(-1);
     }
   };
   thenable.then(retry, retry);
 }
 
 // ---------------------------------------------------------------------------
-// useDeferredValue — React 18 API. Returns the latest value normally, but on
-// the render where `value` changes, returns the previous value and schedules
-// a microtask-deferred commit + re-render. Combined with keep-mode tryBlock,
-// this gives the Solid <Loading> pattern: pass the suspending input through
-// useDeferredValue, compare `value !== deferred` to detect "stale data".
+// startTransition / useTransition — React 18 priority transitions.
+//
+// `startTransition(fn)` runs `fn` synchronously; any setters called inside
+// it schedule transition-priority renders. When a transition-priority render
+// of an already-committed try block suspends, we keep the prior DOM mounted
+// instead of swapping to the pending fallback. `useTransition` returns
+// `[isPending, start]` so a component can show "loading" cues without
+// tearing down the current view.
+// ---------------------------------------------------------------------------
+
+export function startTransition(fn: () => void): void {
+  // Bump the priority flag FIRST so any scheduleRender calls fired by the
+  // listener notification (and by fn itself) are tagged as transition.
+  TRANSITION_DEPTH++;
+  try {
+    tickTransitionCount(+1);
+    try { fn(); }
+    finally { TRANSITION_DEPTH--; }
+  } catch (err) {
+    tickTransitionCount(-1);
+    throw err;
+  }
+  // The synchronous slice is done. Decrement after the scheduler has had a
+  // chance to flush the queued renders this transition produced — if any of
+  // those renders held the transition open by suspending, they incremented
+  // the count themselves via handleSuspense, so the net count stays > 0.
+  queueMicrotask(() => tickTransitionCount(-1));
+}
+
+export function useTransition(slot: symbol): [boolean, (fn: () => void) => void] {
+  const scope = CURRENT_SCOPE!;
+  const block = CURRENT_BLOCK!;
+  let s = scope.hooks.get(slot) as { isPending: boolean; start: (fn: () => void) => void } | undefined;
+  if (s === undefined) {
+    const slotRef = { isPending: false, start: startTransition };
+    s = slotRef;
+    scope.hooks.set(slot, slotRef);
+    const listener = () => {
+      const next = TRANSITION_PENDING_COUNT > 0;
+      if (slotRef.isPending !== next) {
+        slotRef.isPending = next;
+        if (!block.disposed) scheduleRender(block);
+      }
+    };
+    TRANSITION_LISTENERS.add(listener);
+    scope.cleanups.push(() => TRANSITION_LISTENERS.delete(listener));
+  }
+  return [s.isPending, s.start];
+}
+
+// ---------------------------------------------------------------------------
+// useDeferredValue — React 18. Returns the latest value normally; when value
+// changes, returns the PREVIOUS value (synchronously) and schedules a
+// transition-priority re-render where it'll return the new value. Because
+// the re-render runs at transition priority, a suspending consumer (via use())
+// keeps the prior DOM mounted instead of flashing a fallback.
 // ---------------------------------------------------------------------------
 
 interface DeferredSlot<T> {
@@ -1285,21 +1435,33 @@ interface DeferredSlot<T> {
 
 export function useDeferredValue<T>(value: T, slot: symbol): T {
   const scope = CURRENT_SCOPE!;
+  const block = CURRENT_BLOCK!;
   let s = scope.hooks.get(slot) as DeferredSlot<T> | undefined;
   if (s === undefined) {
-    s = { current: value, next: value, scheduled: false, block: CURRENT_BLOCK! };
+    s = { current: value, next: value, scheduled: false, block };
     scope.hooks.set(slot, s);
     return value;
   }
   s.next = value;
   if (s.current === value) return s.current;
+  // If the CURRENT render is already at transition priority, don't defer —
+  // commit the new value immediately. Matches React's `useDeferredValue does
+  // not defer during a transition` semantics — both Original and Deferred
+  // values update in the same paint.
+  if (block.currentRenderMode === 'transition') {
+    s.current = value;
+    return value;
+  }
   if (!s.scheduled) {
     s.scheduled = true;
     queueMicrotask(() => {
       s!.scheduled = false;
       if (s!.block.disposed || s!.current === s!.next) return;
       s!.current = s!.next;
-      scheduleRender(s!.block);
+      // Re-render at transition priority — matches React's contract that the
+      // deferred-value commit can be interrupted by urgent updates and won't
+      // tear down the prior DOM if it suspends.
+      startTransition(() => scheduleRender(s!.block));
     });
   }
   return s.current;
@@ -1321,6 +1483,10 @@ function switchToCatch(state: TrySlot, err: any): void {
   }
   state.hasResolved = false;
   state.pendingThenable = null;
+  if (state.transitionHeld) {
+    state.transitionHeld = false;
+    tickTransitionCount(-1);
+  }
   // No catch arm — bubble to the next enclosing tryBlock (or surface).
   if (state.catchBody === null) {
     const parent = findTryHandler(state.parentBlock);
