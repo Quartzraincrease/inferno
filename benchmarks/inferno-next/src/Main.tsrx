@@ -1,7 +1,3 @@
-// js-framework-benchmark — inferno-next.
-// Authored in TSRX, compiled by @tsrx/inferno-next via the Vite plugin.
-// Plain useState + handler closures (Ripple-style). The reducer variant
-// benchmarked the same — see benchmarks/results/ for the head-to-head.
 
 import { useState } from 'inferno-next';
 

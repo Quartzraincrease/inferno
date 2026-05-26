@@ -57,18 +57,29 @@ export interface Block extends Scope {
   disposed: boolean;
   /** Set on item Blocks: pointer to the enclosing for-block's slot. */
   forSlot: ForSlot | null;
-  /** Set on item Blocks when the for-of header declared `index <name>` —
-   *  read at render time so the compiled body can expose it as a const. */
-  itemIndex?: number;
+  /** Item position within the enclosing for-block. 0 for non-item blocks. */
+  itemIndex: number;
+  /**
+   * Doubly-linked-list pointers for for-block item blocks. Maintained by
+   * reconcileKeyed so move/remove are O(1) pointer ops instead of array
+   * splice. The list head/tail live on ForSlot. Always present (null on
+   * non-item blocks) to keep Block monomorphic — V8 transitioning between
+   * hidden classes for the rare "is this an item?" case was measurably worse
+   * than carrying a couple of null pointers everywhere.
+   */
+  prevSibling: Block | null;
+  nextSibling: Block | null;
+  /** Cached key for this item Block. null on non-item blocks. */
+  key: any;
   /**
    * Render priority for the next scheduled render: 'transition' (queued from
    * inside startTransition — suspending shouldn't swap to fallback if prior
    * UI is committed) or 'urgent' (default). Read & cleared when the render
    * is dispatched.
    */
-  pendingMode?: 'urgent' | 'transition';
+  pendingMode: 'urgent' | 'transition' | null;
   /** The render mode in effect during the body's *current* execution. */
-  currentRenderMode?: 'urgent' | 'transition';
+  currentRenderMode: 'urgent' | 'transition' | null;
 }
 
 interface EffectSlot {
@@ -339,6 +350,10 @@ export function createBlock(
   props: any,
   extra?: any,
 ): Block {
+  // All fields initialized in a fixed order so every Block transitions
+  // through the same V8 hidden-class chain. Item-specific fields (prev/next
+  // sibling, key, itemIndex) sit on every Block as null/0 — paying a few
+  // bytes per non-item block to keep the shape monomorphic in hot paths.
   const block: Block = {
     kind,
     parentBlock,
@@ -355,6 +370,12 @@ export function createBlock(
     pending: false,
     disposed: false,
     forSlot: null,
+    itemIndex: 0,
+    prevSibling: null,
+    nextSibling: null,
+    key: null,
+    pendingMode: null,
+    currentRenderMode: null,
     parent: null,
     // `block: self` makes a Block satisfy the Scope contract.
     block: null as any,
@@ -377,7 +398,7 @@ export function renderBlock(block: Block): void {
   // if, for, comp slots) called synchronously inside an outer body should
   // run at the outer body's priority so transitions propagate down naturally.
   block.currentRenderMode = block.pendingMode ?? prevBlock?.currentRenderMode ?? 'urgent';
-  block.pendingMode = undefined;
+  block.pendingMode = null;
   try {
     block.body(block, block.props, block.extra);
     if (!block.mounted) block.mounted = true;
@@ -1133,9 +1154,45 @@ export function componentSlot(
     state.block = b;
     renderBlock(b);
   } else if (state.block) {
+    // `memo(Component)` — skip the body when new props shallow-equal the
+    // committed props. Matches React.memo's contract; the wrapped fn carries
+    // the `__memo: true` marker the wrapper installs.
+    if ((comp as any).__memo === true && shallowEqualProps(state.block.props, props)) {
+      // Keep the committed props identity — diffing against them next time
+      // is what makes the memo terminate.
+      return;
+    }
     state.block.props = props;
     renderBlock(state.block);
   }
+}
+
+function shallowEqualProps(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) {
+    const k = ka[i];
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+/**
+ * `memo(Component)` — React-shape HOC. Returns a wrapper component that
+ * skips its body when the incoming props are shallow-equal to the committed
+ * ones. Children inside the wrapped body still mount/update normally on the
+ * first render and any non-skip render. Pair with `useCallback` /
+ * `useMemo` on the parent so handler + computed prop refs stay stable across
+ * renders that don't conceptually change the child's view.
+ */
+export function memo<P>(component: ComponentBody<P>): ComponentBody<P> {
+  function memoWrapper(scope: Scope, props: P, extra: any): void {
+    component(scope, props, extra);
+  }
+  (memoWrapper as any).__memo = true;
+  return memoWrapper as ComponentBody<P>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,8 +1736,10 @@ interface ForSlot {
   __kind: 'forBlockSlot';
   start: Comment;
   end: Comment;
-  items: Map<any, Block>;   // key → item Block
-  order: any[];              // current key order
+  items: Map<any, Block>;   // key → item Block (O(1) survivor lookup)
+  head: Block | null;        // first item Block in DOM order
+  tail: Block | null;        // last item Block in DOM order
+  size: number;              // count of item Blocks
   hasCleanups: boolean;      // true once any item registered a useEffect cleanup
 }
 
@@ -1692,8 +1751,11 @@ export function forBlock<T, E = undefined>(
   getKey: (item: T, index: number) => any,
   itemBody: (scope: Scope, item: T, extra: E) => void,
   extra?: E,
-  pure?: number,
+  flags?: number,
 ): void {
+  // flags bitfield: bit 0 = pure (auto-memo), bit 1 = singleRoot (skip per-item
+  // Comment markers because the body emits exactly one Element root). Packed
+  // into a single arg so the compiler emits one numeric literal instead of two.
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as ForSlot | undefined;
   if (state === undefined) {
@@ -1701,12 +1763,29 @@ export function forBlock<T, E = undefined>(
     const end = document.createComment('/for');
     domParent.appendChild(start);
     domParent.appendChild(end);
-    state = { __kind: 'forBlockSlot', start, end, items: new Map(), order: [], hasCleanups: false };
+    state = { __kind: 'forBlockSlot', start, end, items: new Map(), head: null, tail: null, size: 0, hasCleanups: false };
     parentScope[slotKey] = state;
   }
-  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra, !!pure);
+  const f = flags || 0;
+  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra, (f & 1) !== 0, (f & 2) !== 0);
 }
 
+/**
+ * Keyed reconciliation over a doubly-linked list of item Blocks.
+ *
+ * Item Blocks form a sibling chain via `prevSibling` / `nextSibling`; the
+ * ForSlot tracks `head` / `tail` / `size`. Removing or inserting an item is
+ * O(1) pointer updates — no array splice, no `order` array to rebuild. The
+ * Map (`state.items`) is kept only for O(1) survivor lookup by key during the
+ * middle-section diff.
+ *
+ * Algorithm shape matches Inferno/Solid/Vue: prefix walk, suffix walk, then
+ * a middle section that either is pure-insert / pure-remove, or runs the
+ * full survivor-partition + LIS-based move pass. The linked list shows up in
+ * the prefix/suffix walks (cursor advance via .nextSibling / .prevSibling)
+ * and in the splice step that reattaches the new middle to the surrounding
+ * chain.
+ */
 function reconcileKeyed<T, E>(
   parentBlock: Block,
   state: ForSlot,
@@ -1715,50 +1794,54 @@ function reconcileKeyed<T, E>(
   itemBody: (scope: Scope, item: T, extra: E) => void,
   extra: E,
   pure: boolean,
+  singleRoot: boolean,
 ): void {
-  const oldOrder = state.order;
   const oldItems = state.items;
-  const oldLen = oldOrder.length;
+  const oldSize = state.size;
   const newLen = items.length;
   const parentNode = state.end.parentNode!;
 
-  // Fast path: empty → fill
-  if (oldLen === 0) {
+  // Fast path: empty → fill. Append each new block to the tail of the (empty) list.
+  if (oldSize === 0) {
     if (newLen === 0) return;
-    const newOrder: any[] = new Array(newLen);
+    let prev: Block | null = null;
     for (let i = 0; i < newLen; i++) {
       const item = items[i];
       const key = getKey(item, i);
-      const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state, singleRoot);
       oldItems.set(key, block);
-      newOrder[i] = key;
+      block.key = key;
+      block.prevSibling = prev;
+      block.nextSibling = null;
+      if (prev) prev.nextSibling = block;
+      else state.head = block;
+      prev = block;
     }
-    state.order = newOrder;
+    state.tail = prev;
+    state.size = newLen;
     return;
   }
-  // Fast path: clear all
+  // Fast path: clear all.
   if (newLen === 0) {
     batchClearItems(state, oldItems);
-    state.order = [];
+    state.head = null;
+    state.tail = null;
+    state.size = 0;
     return;
   }
 
-  // Find common prefix
+  // ── Prefix walk: advance head cursor while keys match new[i] at position i.
+  let oldFirst: Block | null = state.head;
   let prefixLen = 0;
-  const minLen = oldLen < newLen ? oldLen : newLen;
-  while (prefixLen < minLen) {
-    const oldKey = oldOrder[prefixLen];
+  while (oldFirst !== null && prefixLen < newLen) {
     const newKey = getKey(items[prefixLen], prefixLen);
-    if (oldKey !== newKey) break;
-    // Same key, same position — re-render in place.
-    const block = oldItems.get(oldKey)!;
+    if (oldFirst.key !== newKey) break;
+    const block = oldFirst;
     const newItem = items[prefixLen];
     // Pure-body memo: when the compiler statically proved this for-of body
-    // closes over nothing from parent scope, the body's output is a pure
-    // function of (item, itemIndex). If both are identity-unchanged we can
-    // skip renderBlock entirely — the DOM is already correct.
+    // closes over nothing from parent scope, body output is a pure function
+    // of (item, itemIndex). Identical refs → skip renderBlock entirely.
     if (pure && block.props === newItem && block.itemIndex === prefixLen) {
-      // still keep extra + body fresh in case the parent re-bound them
       block.extra = extra;
       block.body = itemBody as ComponentBody;
     } else {
@@ -1768,22 +1851,21 @@ function reconcileKeyed<T, E>(
       block.itemIndex = prefixLen;
       renderBlock(block);
     }
+    oldFirst = block.nextSibling!;
     prefixLen++;
   }
 
-  if (prefixLen === newLen && newLen === oldLen) {
-    // Lists are identical in key order — nothing more to do.
-    return;
-  }
+  // Both lists fully consumed by prefix? Identical → done.
+  if (prefixLen === newLen && oldFirst === null) return;
 
-  // Find common suffix
-  let oldEnd = oldLen - 1;
+  // ── Suffix walk: retreat tail cursor while keys match new[newEnd].
+  let oldLast: Block | null = state.tail;
   let newEnd = newLen - 1;
-  while (oldEnd >= prefixLen && newEnd >= prefixLen) {
-    const oldKey = oldOrder[oldEnd];
+  let oldRemain = oldSize - prefixLen;
+  while (oldLast !== null && oldRemain > 0 && newEnd >= prefixLen) {
     const newKey = getKey(items[newEnd], newEnd);
-    if (oldKey !== newKey) break;
-    const block = oldItems.get(oldKey)!;
+    if (oldLast.key !== newKey) break;
+    const block = oldLast;
     const newItem = items[newEnd];
     if (pure && block.props === newItem && block.itemIndex === newEnd) {
       block.extra = extra;
@@ -1795,109 +1877,139 @@ function reconcileKeyed<T, E>(
       block.itemIndex = newEnd;
       renderBlock(block);
     }
-    oldEnd--;
+    oldLast = block.prevSibling!;
     newEnd--;
+    oldRemain--;
   }
 
-  // Middle differs.
-  if (prefixLen > oldEnd) {
-    // Only inserts in the middle (old exhausted).
-    const newOrder: any[] = state.order.slice(0, prefixLen);
-    // Anchor: the DOM node right after the suffix items, or end marker.
-    const anchor = newEnd + 1 < newLen
-      ? oldItems.get(oldOrder[oldEnd + 1])!.startMarker!  // first node of suffix
-      : state.end;
+  // Boundaries of the OLD middle in the linked list.
+  //   beforeMiddle = last prefix-matched block (or null if prefix empty)
+  //   afterMiddle  = first suffix-matched block (or null if suffix empty)
+  // When oldRemain === 0, the OLD middle is empty — oldFirst is either null
+  // (prefix consumed all of old) or it points at the first suffix-matched block.
+  let beforeMiddle: Block | null;
+  let afterMiddle: Block | null;
+  if (oldRemain === 0) {
+    afterMiddle = oldFirst;
+    beforeMiddle = afterMiddle ? afterMiddle.prevSibling! : state.tail;
+  } else {
+    beforeMiddle = oldFirst!.prevSibling!;
+    afterMiddle = oldLast!.nextSibling!;
+  }
+
+  // Case: old middle empty, new middle non-empty → only inserts.
+  if (oldRemain === 0) {
+    const anchor: Node = afterMiddle ? afterMiddle.startMarker! : state.end;
+    let prev: Block | null = beforeMiddle;
     for (let i = prefixLen; i <= newEnd; i++) {
       const item = items[i];
       const key = getKey(item, i);
-      const block = mountItem(parentBlock, parentNode, anchor, item, i, itemBody, extra, state);
+      const block = mountItem(parentBlock, parentNode, anchor, item, i, itemBody, extra, state, singleRoot);
       oldItems.set(key, block);
-      newOrder.push(key);
+      block.key = key;
+      block.prevSibling = prev;
+      block.nextSibling = afterMiddle;
+      if (prev) prev.nextSibling = block;
+      else state.head = block;
+      prev = block;
     }
-    // Suffix keys remain in order.
-    for (let i = oldEnd + 1; i < oldLen; i++) newOrder.push(oldOrder[i]);
-    state.order = newOrder;
+    if (afterMiddle) afterMiddle.prevSibling = prev;
+    else state.tail = prev;
+    state.size += (newEnd - prefixLen + 1);
     return;
   }
 
+  // Case: new middle empty, old middle non-empty → only removes.
   if (prefixLen > newEnd) {
-    // Only removes in the middle (new exhausted).
-    for (let i = prefixLen; i <= oldEnd; i++) {
-      const key = oldOrder[i];
-      const block = oldItems.get(key)!;
-      unmountBlock(block);
-      oldItems.delete(key);
+    let cur: Block | null = oldFirst;
+    let removed = 0;
+    while (cur !== afterMiddle) {
+      const next: Block | null = cur!.nextSibling!;
+      unmountBlock(cur!);
+      oldItems.delete(cur!.key);
+      cur = next;
+      removed++;
     }
-    const newOrder: any[] = state.order.slice(0, prefixLen);
-    for (let i = oldEnd + 1; i < oldLen; i++) newOrder.push(oldOrder[i]);
-    state.order = newOrder;
+    if (beforeMiddle) beforeMiddle.nextSibling = afterMiddle;
+    else state.head = afterMiddle;
+    if (afterMiddle) afterMiddle.prevSibling = beforeMiddle;
+    else state.tail = beforeMiddle;
+    state.size -= removed;
     return;
   }
 
-  // General case — both have unique middle sections.
-  // Build map of new keys → new index for the middle, and count how many old
-  // items have a corresponding new key (the survivor count).
-  const newKeysToIdx = new Map<any, number>();
-  const newKeys: any[] = new Array(newEnd - prefixLen + 1);
-  let survivorEstimate = 0;
-  for (let i = prefixLen; i <= newEnd; i++) {
-    const key = getKey(items[i], i);
-    newKeys[i - prefixLen] = key;
+  // ── General case: both middles non-empty. Partition + LIS-move.
+  const newMidLen = newEnd - prefixLen + 1;
+  const newKeys: any[] = new Array(newMidLen);
+  const newKeysToIdx = new Map<any, number>();   // key → MIDDLE-RELATIVE index (0..newMidLen-1)
+  for (let i = 0; i < newMidLen; i++) {
+    const key = getKey(items[prefixLen + i], prefixLen + i);
+    newKeys[i] = key;
     newKeysToIdx.set(key, i);
   }
-  for (let i = prefixLen; i <= oldEnd; i++) {
-    if (newKeysToIdx.has(oldOrder[i])) { survivorEstimate++; if (survivorEstimate > 0) break; }
-  }
 
-  // Full-replace fast path — when zero old items survive the middle (e.g.
-  // `replace` op: same length, all new keys), batch-clear the middle's DOM
-  // in one op instead of N×3 removeChild calls, then mount all new items.
-  // We only take this when the for-block owns its parent AND prefix/suffix
-  // are empty (no surviving neighbours that need to stay in place).
-  if (survivorEstimate === 0 && prefixLen === 0 && oldEnd === oldLen - 1 && newEnd === newLen - 1) {
-    batchClearItems(state, oldItems);
-    state.order = [];
-    // Now mass-mount the new items, appending each before state.end.
-    const newOrder: any[] = new Array(newLen);
-    for (let i = 0; i < newLen; i++) {
-      const item = items[i];
-      const key = newKeys[i];
-      const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state);
-      oldItems.set(key, block);
-      newOrder[i] = key;
+  // Full-replace fast path — when prefix/suffix are empty AND no old items
+  // survive, batch-clear with `textContent = ''` (one DOM op vs N removeChild)
+  // and mass-mount. Detect "no survivors" by checking just the first old block
+  // (the loop in the original code exits after one hit too).
+  if (beforeMiddle === null && afterMiddle === null && !newKeysToIdx.has(oldFirst!.key)) {
+    // Quick scan: confirm no survivor before committing to batch-clear.
+    let anySurvivors = false;
+    let cur: Block | null = oldFirst!.nextSibling!;
+    while (cur !== null) {
+      if (newKeysToIdx.has(cur.key)) { anySurvivors = true; break; }
+      cur = cur.nextSibling!;
     }
-    state.order = newOrder;
-    return;
+    if (!anySurvivors) {
+      batchClearItems(state, oldItems);
+      state.head = null;
+      state.tail = null;
+      state.size = 0;
+      let prev: Block | null = null;
+      for (let i = 0; i < newLen; i++) {
+        const item = items[i];
+        const key = newKeys[i];   // prefixLen === 0, so newKeys spans the full list
+        const block = mountItem(parentBlock, parentNode, state.end, item, i, itemBody, extra, state, singleRoot);
+        oldItems.set(key, block);
+        block.key = key;
+        block.prevSibling = prev;
+        block.nextSibling = null;
+        if (prev) prev.nextSibling = block;
+        else state.head = block;
+        prev = block;
+      }
+      state.tail = prev;
+      state.size = newLen;
+      return;
+    }
   }
 
-  // sources[i] = old index for new[prefixLen + i], or -1 if new (not in old).
-  const sources = new Int32Array(newEnd - prefixLen + 1);
-  for (let i = 0; i < sources.length; i++) sources[i] = -1;
+  // sources[i] = old middle-relative index for new[prefixLen + i], or -1 if new.
+  const sources = new Int32Array(newMidLen);
+  for (let i = 0; i < newMidLen; i++) sources[i] = -1;
 
   let moved = false;
   let lastIdx = 0;
   let patched = 0;
 
-  // Walk old middle: re-render survivors in place, mark unmounts.
-  for (let i = prefixLen; i <= oldEnd; i++) {
-    const oldKey = oldOrder[i];
-    const newIdx = newKeysToIdx.get(oldKey);
-    if (newIdx === undefined) {
-      // Removed.
-      const block = oldItems.get(oldKey)!;
-      unmountBlock(block);
-      oldItems.delete(oldKey);
+  // Walk old middle (linked-list traversal): re-render survivors, unmount removed.
+  let cur: Block | null = oldFirst;
+  let oldIdx = 0;
+  while (cur !== afterMiddle) {
+    const next: Block | null = cur!.nextSibling!;
+    const newRelIdx = newKeysToIdx.get(cur!.key);
+    if (newRelIdx === undefined) {
+      unmountBlock(cur!);
+      oldItems.delete(cur!.key);
+      state.size--;
     } else {
-      sources[newIdx - prefixLen] = i;
-      if (newIdx < lastIdx) moved = true;
-      else lastIdx = newIdx;
+      sources[newRelIdx] = oldIdx;
+      if (newRelIdx < lastIdx) moved = true;
+      else lastIdx = newRelIdx;
       patched++;
-      const block = oldItems.get(oldKey)!;
+      const block = cur!;
+      const newIdx = prefixLen + newRelIdx;
       const newItem = items[newIdx];
-      // Pure-body memo (same as prefix/suffix paths) — most middle survivors
-      // in a typical reorder (swap, etc.) hit this fast path: item ref and
-      // position unchanged, so the body's output is provably identical and
-      // we skip the renderBlock call entirely.
       if (pure && block.props === newItem && block.itemIndex === newIdx) {
         block.extra = extra;
         block.body = itemBody as ComponentBody;
@@ -1909,57 +2021,90 @@ function reconcileKeyed<T, E>(
         renderBlock(block);
       }
     }
+    cur = next;
+    oldIdx++;
   }
 
-  // Build new order array.
-  const newOrder: any[] = state.order.slice(0, prefixLen);
-  for (let i = 0; i < newKeys.length; i++) newOrder.push(newKeys[i]);
-  for (let i = oldEnd + 1; i < oldLen; i++) newOrder.push(oldOrder[i]);
+  // Fast bail: all survivors AND no moves AND no mounts → old middle is the
+  // same shape & order as new middle. Linked-list pointers are still correct
+  // (we never touched them). Just return.
+  if (!moved && patched === newMidLen) return;
 
-  // Anchor for inserts in the middle = first node of suffix (or end marker).
-  const middleAnchor: Node = oldEnd + 1 < oldLen
-    ? oldItems.get(oldOrder[oldEnd + 1])!.startMarker!
-    : state.end;
+  // Walk new middle back-to-front. For each new position: mount / move / leave.
+  // Track:
+  //   nextBlock  = block at position i+1 (already placed), or afterMiddle initially
+  //                — used as the DOM anchor and prev/next neighbour
+  //   lastPlaced = block placed in the FIRST iteration (= new middle's tail)
+  const middleEndAnchor: Node = afterMiddle ? afterMiddle.startMarker! : state.end;
+  let nextBlock: Block | null = afterMiddle;
+  let lastPlaced: Block | null = null;
 
   if (moved) {
-    // LIS — find longest increasing subsequence over sources (only for surviving items).
     const seq = lis(sources);
     let seqIdx = seq.length - 1;
-    // Walk new middle from end to start; if our position is in LIS, leave alone, else move/mount.
-    for (let i = sources.length - 1; i >= 0; i--) {
+    for (let i = newMidLen - 1; i >= 0; i--) {
       const targetIdx = i + prefixLen;
       const key = newKeys[i];
-      // Anchor = the DOM node that should be AFTER this item.
-      const nextItem = targetIdx + 1 < newOrder.length ? oldItems.get(newOrder[targetIdx + 1]) : null;
-      const anchor: Node = nextItem ? nextItem.startMarker! : middleAnchor;
+      const anchor: Node = nextBlock ? nextBlock.startMarker! : middleEndAnchor;
+      let block: Block;
       if (sources[i] === -1) {
-        // New item — mount it.
+        // Mount: new item, no old counterpart.
         const item = items[targetIdx];
-        const block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state);
+        block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state, singleRoot);
         oldItems.set(key, block);
+        block.key = key;
+        state.size++;
       } else if (seqIdx < 0 || i !== seq[seqIdx]) {
-        // Moved — relocate the DOM range before the anchor.
-        const block = oldItems.get(key)!;
+        // Move: survivor not in the LIS → DOM range moves before anchor.
+        block = oldItems.get(key)!;
         moveBlockBefore(block, anchor);
       } else {
+        // Leave: survivor in the LIS → DOM stays put.
+        block = oldItems.get(key)!;
         seqIdx--;
       }
+      // Re-link into the new middle chain. We rebuild middle pointers from
+      // scratch; every middle block's prev/next gets rewritten here.
+      block.nextSibling = nextBlock;
+      if (nextBlock) nextBlock.prevSibling = block;
+      if (lastPlaced === null) lastPlaced = block;
+      nextBlock = block;
     }
-  } else if (patched !== newKeys.length) {
-    // No moves, but some new mounts. Walk and insert those.
-    for (let i = sources.length - 1; i >= 0; i--) {
-      if (sources[i] !== -1) continue;
+  } else {
+    // No moves but at least one mount (we'd have returned already if all survivors).
+    for (let i = newMidLen - 1; i >= 0; i--) {
       const targetIdx = i + prefixLen;
-      const nextItem = targetIdx + 1 < newOrder.length ? oldItems.get(newOrder[targetIdx + 1]) : null;
-      const anchor: Node = nextItem ? nextItem.startMarker! : middleAnchor;
       const key = newKeys[i];
-      const item = items[targetIdx];
-      const block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state);
-      oldItems.set(key, block);
+      const anchor: Node = nextBlock ? nextBlock.startMarker! : middleEndAnchor;
+      let block: Block;
+      if (sources[i] === -1) {
+        const item = items[targetIdx];
+        block = mountItem(parentBlock, parentNode, anchor, item, targetIdx, itemBody, extra, state, singleRoot);
+        oldItems.set(key, block);
+        block.key = key;
+        state.size++;
+      } else {
+        block = oldItems.get(key)!;
+      }
+      block.nextSibling = nextBlock;
+      if (nextBlock) nextBlock.prevSibling = block;
+      if (lastPlaced === null) lastPlaced = block;
+      nextBlock = block;
     }
   }
 
-  state.order = newOrder;
+  // Splice the freshly-built new middle in between beforeMiddle and afterMiddle.
+  // newMiddleHead = `nextBlock` after the loop (last iteration placed item[prefixLen]).
+  // newMiddleTail = `lastPlaced` (first iteration placed item[newEnd]).
+  // newMiddleTail.nextSibling was set to afterMiddle in the first loop iter,
+  // and afterMiddle.prevSibling (if non-null) was set to newMiddleTail. So only
+  // the HEAD side of the splice remains.
+  const newMiddleHead = nextBlock!;
+  const newMiddleTail = lastPlaced!;
+  newMiddleHead.prevSibling = beforeMiddle;
+  if (beforeMiddle) beforeMiddle.nextSibling = newMiddleHead;
+  else state.head = newMiddleHead;
+  if (!afterMiddle) state.tail = newMiddleTail;
 }
 
 /**
@@ -2007,7 +2152,28 @@ function mountItem<T, E>(
   body: (s: Scope, item: T, extra: E) => void,
   extra: E,
   forSlot: ForSlot,
+  singleRoot: boolean,
 ): Block {
+  if (singleRoot) {
+    // Compiler verified the body emits exactly one Element root — skip the
+    // per-item Comment markers and use the inserted element as both start
+    // and end. For a 1000-row table that means 2000 fewer DOM nodes inside
+    // <tbody>, which the browser's layout/paint walks every time. Big paint
+    // win when the slowdown is "tbody has 3000 children" not "JS is slow".
+    const block = createBlock('control-flow', parentBlock, parentNode, null, anchor, body as ComponentBody, item, extra);
+    block.forSlot = forSlot;
+    block.itemIndex = index;
+    renderBlock(block);
+    // Body inserted ONE node right before `anchor` via
+    // `__block.parentNode.insertBefore(_root, __block.endMarker)`. Grab it
+    // and promote it to start === end. From now on `block.endMarker` is the
+    // actual element (so subsequent body re-renders insert nothing — the
+    // update path mutates the cached _b._el$N refs directly).
+    const root = anchor.previousSibling!;
+    block.startMarker = root;
+    block.endMarker = root;
+    return block;
+  }
   const start = document.createComment('it');
   const end = document.createComment('/it');
   parentNode.insertBefore(start, anchor);

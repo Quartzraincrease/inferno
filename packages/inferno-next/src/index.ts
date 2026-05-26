@@ -23,6 +23,7 @@ export {
   useDeferredValue,
   useTransition,
   startTransition,
+  memo,
 
   // Context
   createContext,

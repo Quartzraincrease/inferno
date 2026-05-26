@@ -805,7 +805,9 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   const afterLines = [];
   for (const fc of forCalls) {
     ctx.runtimeNeeded.add('forBlock');
-    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr}${fc.pure ? ', 1' : ''});`);
+    // flags: bit 0 = pure (auto-memo), bit 1 = singleRoot (skip per-item markers).
+    const flags = (fc.pure ? 1 : 0) | (fc.singleRoot ? 2 : 0);
+    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr}${flags ? ', ' + flags : ''});`);
   }
   for (const ic of ifCalls) {
     ctx.runtimeNeeded.add('ifBlock');
@@ -1657,6 +1659,21 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     if (pure && containsComponentCallOrControlFlow(subStmts)) pure = false;
   }
 
+  // Single-root detection: when the body emits exactly one Element root and
+  // no other JSX siblings (no Fragment, no Component, no top-level if/for/try),
+  // the runtime can skip per-item Comment markers and use the row element
+  // itself as the block boundary. For a 1000-row keyed list this removes 2000
+  // Comment nodes from the parent — meaningful paint-time savings when the
+  // parent is laid out per child (e.g. <tbody> in js-framework-benchmark).
+  let singleRoot = false;
+  {
+    const jsxChildren = subStmts.filter(s => isJsxNode(s));
+    if (jsxChildren.length === 1) {
+      const c = jsxChildren[0];
+      if (c.type === 'Element' && !isComponentTag(c)) singleRoot = true;
+    }
+  }
+
   return {
     id: ctx.nextHelperId++,
     itemsExpr,
@@ -1664,6 +1681,7 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     bodyHelper: itemHelperName,
     extraExpr: 'undefined',
     pure,
+    singleRoot,
     hostPath: null,
   };
 }
