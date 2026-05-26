@@ -331,6 +331,16 @@ importers:
         specifier: ^5.105.4
         version: 5.107.1(@swc/core@1.15.24(@swc/helpers@0.5.21))
 
+  hacker-news:
+    dependencies:
+      inferno-next:
+        specifier: workspace:*
+        version: link:../packages/inferno-next
+    devDependencies:
+      vite:
+        specifier: ^8.0.14
+        version: 8.0.14(@types/node@25.9.1)(jiti@2.7.0)(sass@1.100.0)(terser@5.48.0)
+
   packages/inferno:
     dependencies:
       csstype:

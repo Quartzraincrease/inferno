@@ -1,0 +1,380 @@
+/* Inferno-Next HN — colors mirror the Vue/Solid HN clones (blue #335d92).
+   Switch the header / score / accent colors to #ff6600 to get classic HN. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font: 15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: #f2f3f5;
+  color: #34495e;
+  padding-top: 55px;
+  overflow-y: scroll;
+}
+
+a {
+  color: #34495e;
+  text-decoration: none;
+}
+
+/* ------------------------------------------------------------------ Header */
+
+.header {
+  background: #335d92;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 55px;
+  z-index: 999;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.header-inner {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 15px 5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-inner a {
+  color: rgba(255, 255, 255, 0.8);
+  letter-spacing: 0.075em;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  padding: 4px 6px;
+  transition: color 0.15s;
+}
+
+.header-inner a:hover,
+.header-inner a.active {
+  color: #fff;
+}
+
+.header-inner .logo {
+  font-size: 1.1em;
+  font-weight: bold;
+  letter-spacing: 0.05em;
+  text-transform: none;
+  padding-right: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.header-inner .logo-mark {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  background: #ff6600;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 800;
+  font-size: 14px;
+  line-height: 22px;
+  text-align: center;
+  border-radius: 3px;
+}
+
+.header-inner .github {
+  margin-left: auto;
+  font-size: 0.8em;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.header-inner .pending {
+  margin-left: 12px;
+  font-size: 0.7em;
+  letter-spacing: 0.1em;
+  color: rgba(255, 255, 255, 0.9);
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------- Main layout */
+
+.view {
+  background: #fff;
+  max-width: 800px;
+  margin: 0 auto;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.list-nav {
+  background: #fff;
+  border-bottom: 1px solid #eaecef;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 14px 16px;
+  font-size: 0.95em;
+  color: #828282;
+}
+
+.list-nav .disabled { color: #ccc; pointer-events: none; }
+
+.list-nav .page-num { min-width: 70px; text-align: center; }
+
+/* ------------------------------------------------------------- Story items */
+
+.story-list { list-style: none; padding: 0; margin: 0; }
+
+.story-item {
+  padding: 20px 30px 20px 80px;
+  border-bottom: 1px solid #eee;
+  position: relative;
+  line-height: 1.4;
+  transition: background 0.15s;
+}
+
+.story-item:hover { background: #fafbfc; }
+
+.story-item:last-of-type { border-bottom: none; }
+
+.story-item .score {
+  font-size: 1.1em;
+  font-weight: 700;
+  color: #335d92;
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 80px;
+  text-align: center;
+  margin-top: -10px;
+}
+
+.story-item .title {
+  font-size: 1em;
+  margin: 0;
+  padding-right: 8px;
+}
+
+.story-item .title a {
+  color: #34495e;
+}
+
+.story-item .title a:hover { color: #335d92; }
+
+.story-item .host {
+  font-size: 0.85em;
+  color: #828282;
+  margin-left: 6px;
+}
+
+.story-item .meta {
+  font-size: 0.85em;
+  color: #828282;
+  margin-top: 3px;
+}
+
+.story-item .meta a {
+  color: #828282;
+}
+
+.story-item .meta a:hover { color: #335d92; }
+
+.story-item.job .score { color: #828282; font-weight: 400; font-size: 0.85em; }
+
+/* ----------------------------------------------------------- Story detail */
+
+.item-view-header {
+  background: #fff;
+  padding: 18px 30px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  position: relative;
+}
+
+.item-view-header h1 {
+  display: inline;
+  font-size: 1.5em;
+  margin: 0;
+  margin-right: 6px;
+}
+
+.item-view-header h1 a { color: #34495e; }
+
+.item-view-header h1 a:hover { color: #335d92; }
+
+.item-view-header .host {
+  font-size: 0.85em;
+  color: #828282;
+}
+
+.item-view-header .meta,
+.item-view-header .meta a {
+  font-size: 0.85em;
+  color: #828282;
+}
+
+.item-view-header .meta a:hover { color: #335d92; }
+
+.item-view-comments {
+  background: #fff;
+  margin-top: 10px;
+  padding: 0 32px 16px;
+}
+
+.item-view-comments-header {
+  margin: 0;
+  font-size: 1.1em;
+  padding: 16px 0;
+  position: relative;
+  font-weight: 600;
+}
+
+.comment-children { list-style: none; padding: 0; margin: 0; }
+
+.comment {
+  border-top: 1px solid #eee;
+  position: relative;
+}
+
+.comment-children .comment {
+  margin-left: 1.5em;
+  margin-right: -1em;
+}
+
+.comment .by,
+.comment .text,
+.comment .toggle {
+  font-size: 0.9em;
+  margin: 1em 0;
+}
+
+.comment .by {
+  color: #828282;
+}
+
+.comment .by a {
+  color: #828282;
+  font-weight: 600;
+}
+
+.comment .by a:hover { color: #335d92; }
+
+.comment .text { overflow-wrap: break-word; }
+
+.comment .text :is(a) { color: #335d92; text-decoration: underline; }
+
+.comment .text p { margin: 0.5em 0; }
+
+.comment .text pre {
+  white-space: pre-wrap;
+  background: #f2f3f5;
+  padding: 8px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.comment .toggle {
+  background-color: #fffbf2;
+  padding: 0.3em 0.5em;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-block;
+}
+
+.comment .toggle:hover { background-color: #fdf3d8; }
+
+.comment .toggle.open {
+  padding: 0;
+  background: transparent;
+  margin-bottom: -0.5em;
+}
+
+/* ---------------------------------------------------------------- User view */
+
+.user-view {
+  background: #fff;
+  padding: 2em 3em;
+}
+
+.user-view h1 {
+  margin: 0;
+  font-size: 1.5em;
+}
+
+.user-view .meta {
+  list-style-type: none;
+  padding: 0;
+}
+
+.user-view .meta li {
+  margin: 0.5em 0;
+}
+
+.user-view .label {
+  display: inline-block;
+  min-width: 4em;
+  color: #828282;
+}
+
+.user-view .about { margin: 1em 0; }
+
+.user-view .links a { color: #335d92; text-decoration: underline; }
+
+/* ---------------------------------------------------------------- Misc */
+
+.loading {
+  padding: 80px 30px;
+  text-align: center;
+  color: #828282;
+  font-size: 0.95em;
+  letter-spacing: 0.05em;
+}
+
+.loading .spinner {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  border: 3px solid #eaecef;
+  border-top-color: #335d92;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+  margin-right: 10px;
+}
+
+.list.stale { opacity: 0.6; transition: opacity 0.2s; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.error-view {
+  padding: 60px 30px;
+  text-align: center;
+  color: #c0392b;
+  background: #fff;
+}
+
+.error-view h2 { margin: 0 0 8px; }
+
+.error-view button {
+  margin-top: 16px;
+  padding: 8px 16px;
+  background: #335d92;
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
+.error-view button:hover { background: #2c5180; }
+
+@media (max-width: 860px) {
+  .header-inner .github { display: none; }
+}
+
+@media (max-width: 600px) {
+  .story-item { padding: 15px 25px 15px 70px; }
+  .story-item .score { left: 0; width: 70px; }
+  .item-view-header { padding: 14px 20px; }
+  .item-view-comments { padding: 0 22px 12px; }
+  .user-view { padding: 1.5em; }
+}

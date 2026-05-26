@@ -430,17 +430,22 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   // Track HTML index across top-level nodes — component-call nodes don't
   // contribute HTML, so their indices DON'T advance the frag position. Each
   // HTML-contributing top-level node lives at _root.childNodes[htmlIdx].
+  // `single` mode = exactly one non-component Element root, no <inferno-frag>
+  // wrapping. Anything else (multi-root, single Text, single comp call) goes
+  // through the wrapper path; HTML-contributing nodes are at `_root.childNodes[i]`.
+  const single = jsxNodes.length === 1 && jsxNodes[0].type === 'Element' && !isComponentTag(jsxNodes[0]);
   const partsHtml = [];
   let htmlIdx = 0;
   for (const node of jsxNodes) {
     const nodeIsComp = node.type === 'Element' && isComponentTag(node);
-    // Single-root: path=[]. Multi-root HTML: path=[htmlIdx]. Component-call: path=[].
-    const nodePath = (jsxNodes.length > 1 && !nodeIsComp) ? [htmlIdx] : [];
+    // Single non-comp Element: path=[] (lives at _root directly).
+    // Otherwise (wrapped in <inferno-frag>): path=[htmlIdx] when HTML-contributing.
+    // Component-call: path=[] (no DOM contributed, host is the wrapper).
+    const nodePath = (!single && !nodeIsComp) ? [htmlIdx] : [];
     partsHtml.push(emitNodeHtml(node, nodePath, elementBindings, forCalls, ifCalls, compCalls, tryCalls, ctx, componentName, inlinedSubs, parentNs, cssHash));
     if (!nodeIsComp) htmlIdx++;
   }
   const html = partsHtml.join('');
-  const single = jsxNodes.length === 1 && jsxNodes[0].type === 'Element' && !isComponentTag(jsxNodes[0]);
   // Was every emitted JSX node a component-call (or any non-HTML node that
   // contributes no HTML)? Then there's no template to clone — control-flow /
   // component-slot calls render directly into __block.parentNode using
@@ -599,6 +604,14 @@ function emitBindingMount(b, elVar) {
       _b._prev$${b.id} = _v;
     }`;
     }
+    case 'htmlOnlyChild': {
+      return `    {
+      const _v = ${E};
+      ${elVar}.innerHTML = (_v == null ? '' : String(_v));
+      _b._el$${b.id} = ${elVar};
+      _b._prev$${b.id} = _v;
+    }`;
+    }
     case 'text': {
       return `    {
       const _v = ${E};
@@ -669,6 +682,9 @@ function emitBindingUpdate(b) {
     case 'textOnlyChild':
     case 'text': {
       return `    { const _v = ${E}; if (_b._prev$${b.id} !== _v) { setText(_b._txt$${b.id}, _v); _b._prev$${b.id} = _v; } }`;
+    }
+    case 'htmlOnlyChild': {
+      return `    { const _v = ${E}; if (_b._prev$${b.id} !== _v) { _b._el$${b.id}.innerHTML = (_v == null ? '' : String(_v)); _b._prev$${b.id} = _v; } }`;
     }
     case 'attr': {
       return `    { const _v = ${E}; if (_b._prev$${b.id} !== _v) { setAttribute(_b._el$${b.id}, ${JSON.stringify(b.name)}, _v); _b._prev$${b.id} = _v; } }`;
@@ -838,6 +854,14 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
       path,
     });
     // The element stays empty in the template — runtime appends a Text node.
+  } else if (children.length === 1 && children[0].type === 'Html') {
+    // `{html expr}` as the only child — set the element's innerHTML directly.
+    // Empty template; runtime injects the HTML on mount and diff-replaces on update.
+    bindings.push({
+      id: bindings.length, kind: 'htmlOnlyChild',
+      expr: printExpr(children[0].expression),
+      path,
+    });
   } else {
     // Mixed children — walk them in order.
     let childIdx = 0;
@@ -882,6 +906,14 @@ function emitElementHtml(node, path, bindings, forCalls, ifCalls, compCalls, try
         });
         html += '<!>';
         childIdx++;
+      } else if (child.type === 'Html') {
+        // `{html expr}` mixed with sibling children isn't supported — wrap the
+        // expression in a dedicated parent (e.g. `<span>{html ...}</span>`)
+        // and the only-child fast path will set innerHTML on the wrapper.
+        throw new Error(
+          '{html expr} must be the ONLY child of its parent element. ' +
+          'Wrap it in a dedicated element like <span>{html expr}</span>.'
+        );
       } else if (child.type === 'TSRXExpression') {
         // {expr} at JSX child position. Recognised forms:
         //   - `{ref refExpr}` → ref-attach binding on the host element (TSRX RefExpression)

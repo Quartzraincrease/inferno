@@ -3,6 +3,7 @@ packages:
   - fixtures/*
   - demo/*
   - benchmarks/*
+  - hacker-news
 
 linkWorkspacePackages: true
 sharedWorkspaceLockfile: true

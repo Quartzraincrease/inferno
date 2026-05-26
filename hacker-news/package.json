@@ -1,0 +1,18 @@
+{
+  "name": "@inferno-next/hacker-news",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Hacker News clone built on inferno-next — exercises Suspense (use + try/pending/catch), useTransition, useDeferredValue, routing, and template-clone rendering.",
+  "scripts": {
+    "dev": "vite --port 5180 --strictPort",
+    "build": "vite build",
+    "preview": "vite preview --port 5180"
+  },
+  "dependencies": {
+    "inferno-next": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^8.0.14"
+  }
+}

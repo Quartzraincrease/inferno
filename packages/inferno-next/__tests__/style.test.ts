@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { mount } from './_helpers';
 import {
   StaticStringStyle, StaticObjectStyle, DynamicObjectStyle, DynamicStringStyle,
@@ -10,7 +10,7 @@ import {
 describe('style prop — static forms', () => {
   it('inlines a static string style into the template (no runtime setStyle)', () => {
     const r = mount(StaticStringStyle);
-    const div = r.find('div');
+    const div = r.find('div') as HTMLElement;
     // The exact normalization differs by engine — check parsed CSSOM, not the raw string.
     expect(div.style.color).toBe('red');
     expect(div.style.padding).toBe('4px');
