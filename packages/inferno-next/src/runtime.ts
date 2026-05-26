@@ -103,7 +103,6 @@ export function getCurrentBlock(): Block {
 
 const QUEUE: Block[] = [];
 let scheduled = false;
-let flushDepth = 0;       // re-entrancy guard for setters fired during render
 let syncFlush = false;    // flushSync sets this to drain the queue synchronously
 
 // ---------------------------------------------------------------------------
@@ -157,21 +156,15 @@ export function scheduleRender(block: Block): void {
 
 function flush(): void {
   scheduled = false;
-  flushDepth++;
-  try {
-    // Drain the queue; setters fired during a body re-add to QUEUE and we keep draining.
-    while (QUEUE.length) {
-      const block = QUEUE.shift()!;
-      block.pending = false;
-      if (!block.disposed) {
-        try { renderBlock(block); }
-        catch (err) { handleRenderError(block, err); }
-      }
+  while (QUEUE.length) {
+    const block = QUEUE.shift()!;
+    block.pending = false;
+    if (!block.disposed) {
+      try { renderBlock(block); }
+      catch (err) { handleRenderError(block, err); }
     }
-    commitEffects();
-  } finally {
-    flushDepth--;
   }
+  commitEffects();
 }
 
 /**
@@ -593,6 +586,7 @@ export function useMemo<T>(compute: (...deps: any[]) => T, deps: any[], slot: sy
   const scope = CURRENT_SCOPE!;
   const prev = scope.hooks.get(slot) as { deps: any[]; value: T } | undefined;
   if (prev && !depsChanged(prev.deps, deps)) return prev.value;
+  // eslint-disable-next-line prefer-spread
   const value = compute.apply(null, deps);
   scope.hooks.set(slot, { deps, value });
   return value;

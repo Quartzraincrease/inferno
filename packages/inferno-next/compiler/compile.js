@@ -495,7 +495,6 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   const mountLines = [];
   mountLines.push(`    _b = __s.${bindingsName} = {};`);
 
-  let tpl = null;
   let elementVars;
   let ensureVar;
   if (!noTemplate) {
@@ -516,7 +515,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
     const flag = nsFlag(tplNs);
     const fragArg = (!single && flag !== 0) ? 1 : 0;
     const tplHtml = (single || flag !== 0) ? html : `<inferno-frag>${html}</inferno-frag>`;
-    tpl = allocTemplate(ctx, tplHtml, flag, fragArg);
+    const tpl = allocTemplate(ctx, tplHtml, flag, fragArg);
     mountLines.push(`    const _root = clone(${tpl});`);
     elementVars = new Map();
     let varCounter = 0;
