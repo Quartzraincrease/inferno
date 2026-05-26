@@ -536,7 +536,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   } else {
     // No template — host is __block.parentNode. Stash it once.
     mountLines.push(`    _b._compHost = __block.parentNode;`);
-    ensureVar = (_path) => `_b._compHost`;
+    ensureVar = () => `_b._compHost`;
   }
 
   // Emit per-binding mount code.
