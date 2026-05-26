@@ -35,14 +35,7 @@ const VOID_ELEMENTS = new Set([
 const HOOK_NAMES = new Set([
   'useState', 'useReducer', 'useEffect', 'useLayoutEffect', 'useInsertionEffect',
   'useMemo', 'useCallback', 'useRef', 'useId', 'useEffectEvent', 'useImperativeHandle',
-]);
-
-const RUNTIME_NAMES = new Set([
-  'createRoot', 'flushSync', 'delegateEvents',
-  'template', 'clone', 'setText', 'setAttribute', 'setClassName',
-  'setStyle', 'injectStyle',
-  'forBlock', 'createContext', 'use', 'createPortal',
-  ...HOOK_NAMES,
+  'useDeferredValue',
 ]);
 
 // Namespace inheritance — mirrors HTML5 foreign-content rules. The element
@@ -581,7 +574,7 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   ctx._portalCalls = [];
   for (const tc of tryCalls) {
     ctx.runtimeNeeded.add('tryBlock');
-    afterLines.push(`  tryBlock(__s, ${JSON.stringify('_try$' + tc.id)}, __s.${bindingsName}._tryHost$${tc.id}, ${tc.tryHelper}, ${tc.catchHelper});`);
+    afterLines.push(`  tryBlock(__s, ${JSON.stringify('_try$' + tc.id)}, __s.${bindingsName}._tryHost$${tc.id}, ${tc.tryHelper}, ${tc.catchHelper}, ${tc.pendingHelper}, ${tc.keep ? 'true' : 'false'});`);
   }
 
   return {
@@ -1061,8 +1054,20 @@ function makeCompCall(node, ctx, componentName, inlinedSubs, bindings, forCalls,
 // ===========================================================================
 
 function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', cssHash = null) {
-  // node.block = try BlockStatement, node.handler = CatchClause (param, resetParam, body)
-  const tryStmts = node.block.body;
+  // node.block = try BlockStatement, node.handler = CatchClause (param, resetParam, body),
+  // node.pending = optional BlockStatement (TSRX `pending { ... }`)
+  let tryStmts = node.block.body;
+  // Solid <Loading>-style opt-in: `'use keep'` directive at the top of the
+  // try body. Strip it from the compiled body and flag the runtime call.
+  let keep = false;
+  if (tryStmts.length > 0
+      && tryStmts[0].type === 'ExpressionStatement'
+      && tryStmts[0].expression
+      && tryStmts[0].expression.type === 'Literal'
+      && tryStmts[0].expression.value === 'use keep') {
+    keep = true;
+    tryStmts = tryStmts.slice(1);
+  }
   const tryHelperName = `__try$${ctx.nextHelperId++}`;
   const tryFake = {
     type: 'Component',
@@ -1073,7 +1078,22 @@ function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
   const tryFn = compileFunctionBody(tryFake, ctx, tryHelperName, parentNs, cssHash);
   inlinedSubs.push(tryFn + ';');
 
-  let catchHelperName = '() => null';
+  // Optional `pending { ... }` arm — compiled like any sub-body.
+  let pendingHelperName = 'null';
+  if (node.pending && node.pending.body && node.pending.body.length > 0) {
+    const pendingHelper = `__pending$${ctx.nextHelperId++}`;
+    const pendingFake = {
+      type: 'Component',
+      id: { type: 'Identifier', name: pendingHelper },
+      params: [],
+      body: node.pending.body,
+    };
+    const pendingFn = compileFunctionBody(pendingFake, ctx, pendingHelper, parentNs, cssHash);
+    inlinedSubs.push(pendingFn + ';');
+    pendingHelperName = pendingHelper;
+  }
+
+  let catchHelperName = 'null';
   if (node.handler) {
     const handler = node.handler;
     const errName = handler.param?.name || '_err';
@@ -1113,6 +1133,8 @@ function makeTryCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     id: ctx.nextHelperId++,
     tryHelper: tryHelperName,
     catchHelper: catchHelperName,
+    pendingHelper: pendingHelperName,
+    keep,
     hostPath: null,
   };
 }

@@ -5,6 +5,8 @@ export {
   createRoot,
   flushSync,
   drainPassiveEffects,
+  hasPendingWork,
+  act,
   type Root,
 
   // Hooks
@@ -19,11 +21,16 @@ export {
   useId,
   useImperativeHandle,
   useEffectEvent,
+  useDeferredValue,
 
   // Context
   createContext,
   use,
   type Context,
+
+  // Suspense
+  isSuspenseException,
+  type TrackedThenable,
 
   // Compiler-emitted runtime helpers
   template,

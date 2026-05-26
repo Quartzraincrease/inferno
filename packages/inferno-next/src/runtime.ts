@@ -119,7 +119,10 @@ function flush(): void {
     while (QUEUE.length) {
       const block = QUEUE.shift()!;
       block.pending = false;
-      if (!block.disposed) renderBlock(block);
+      if (!block.disposed) {
+        try { renderBlock(block); }
+        catch (err) { handleRenderError(block, err); }
+      }
     }
     commitEffects();
   } finally {
@@ -141,7 +144,10 @@ export function flushSync<T>(fn: () => T): T {
     while (QUEUE.length) {
       const block = QUEUE.shift()!;
       block.pending = false;
-      if (!block.disposed) renderBlock(block);
+      if (!block.disposed) {
+        try { renderBlock(block); }
+        catch (err) { handleRenderError(block, err); }
+      }
     }
     commitEffectsSync();
     return result;
@@ -176,6 +182,36 @@ export function drainPassiveEffects(): void {
   // about to drain inline.
   passiveScheduled = false;
   drainPhase(PASSIVE);
+}
+
+/** True if there's a queued render or any uncommitted effect. Used by `act`. */
+export function hasPendingWork(): boolean {
+  return QUEUE.length > 0
+    || effectQueues[INSERTION].length > 0
+    || effectQueues[LAYOUT].length > 0
+    || effectQueues[PASSIVE].length > 0;
+}
+
+/**
+ * React-parity `act(fn)` — wrap test code that schedules async work (Promise
+ * resolutions, effects, scheduled renders) so all of it commits before the
+ * `await act(...)` resolves. Iterates microtask ticks + passive-effect drains
+ * until the scheduler is quiescent. The sync overload (`act(() => {...})`)
+ * returns void synchronously when no async work was triggered — but using
+ * `await act(...)` is always safe.
+ */
+export async function act<T>(fn: () => T | Promise<T>): Promise<T> {
+  const result = await Promise.resolve(fn());
+  // Stabilize: alternate microtask drains and passive-effect drains until
+  // nothing's left in either queue. Capped to avoid infinite loops on bugs.
+  for (let i = 0; i < 50; i++) {
+    // Multiple microtask ticks to drain Promise.then chains (use(promise)
+    // → status check → retry → renderBlock, etc).
+    for (let j = 0; j < 5; j++) await Promise.resolve();
+    drainPassiveEffects();
+    if (!hasPendingWork()) return result;
+  }
+  throw new Error('act(): scheduler did not stabilize after 50 iterations — likely an infinite render loop');
 }
 
 function commitEffectsSync(): void {
@@ -295,6 +331,10 @@ export function renderBlock(block: Block): void {
   const prevBlock = CURRENT_BLOCK;
   CURRENT_SCOPE = block;
   CURRENT_BLOCK = block;
+  // Reset the per-render `use(thenable)` call-order counter. Cached entries
+  // in __thenables persist so that earlier use() calls return synchronously
+  // on replay-after-resolve (matches React's thenableState[index] scheme).
+  (block as any).__thenableIdx = 0;
   try {
     block.body(block, block.props, block.extra);
     if (!block.mounted) block.mounted = true;
@@ -597,24 +637,37 @@ export function createContext<T>(defaultValue: T): Context<T> {
 }
 
 /**
- * React 19's `use()` — for the spike, supports `use(context)` only.
- * Walks the Block tree from CURRENT_BLOCK upward to find a Provider's value.
+ * React 19's `use()` — accepts either a Context<T> or a thenable (Promise<T>).
+ *
+ * - `use(context)`: walks the Block tree from CURRENT_BLOCK upward to find a
+ *   Provider's value (or the default).
+ * - `use(thenable)`: if fulfilled, returns the value; if rejected, rethrows
+ *   the reason (caught by the nearest tryBlock's catch); if pending, throws
+ *   an internal SuspenseException (caught by the nearest tryBlock and routed
+ *   to its `pending` body).
+ *
+ * The thenable mutates in place to gain `.status` / `.value` / `.reason`
+ * fields the second time it's seen — matches React's `trackUsedThenable`.
+ * Per-block `thenableState[]` keyed by call index lets the body replay
+ * synchronously after the promise resolves.
  */
-/**
- * Walk Scope.parent (within current block) then Block.parentBlock (cross-block)
- * looking for a Provider for `context`. Returns the nearest value or the default.
- */
-export function use<T>(context: Context<T>): T {
-  if (!context || context.$$kind !== CONTEXT_TAG) {
-    throw new Error('use(): argument is not a Context (Suspense / promise use() not implemented yet)');
+export function use<T>(usable: Context<T> | PromiseLike<T> | TrackedThenable<T>): T {
+  if (usable && (usable as any).$$kind === CONTEXT_TAG) {
+    return useContextInternal(usable as Context<T>);
   }
+  if (usable == null || typeof (usable as any).then !== 'function') {
+    throw new Error('use(): argument is not a Context nor a thenable');
+  }
+  return useThenable(usable as TrackedThenable<T>);
+}
+
+function useContextInternal<T>(context: Context<T>): T {
   let s: Scope | null = CURRENT_SCOPE;
   while (s !== null) {
     const m = (s as any).$$ctxValues as Map<Context<any>, any> | undefined;
     if (m && m.has(context)) return m.get(context) as T;
     s = s.parent;
   }
-  // Cross block boundaries: walk up from the parent block's root scope.
   let b: Block | null = CURRENT_BLOCK ? CURRENT_BLOCK.parentBlock : null;
   while (b !== null) {
     const m = (b as any).$$ctxValues as Map<Context<any>, any> | undefined;
@@ -622,6 +675,60 @@ export function use<T>(context: Context<T>): T {
     b = b.parentBlock;
   }
   return context.defaultValue;
+}
+
+// ---------------------------------------------------------------------------
+// Suspense — use(thenable) and the SuspenseException sentinel.
+// ---------------------------------------------------------------------------
+
+export interface TrackedThenable<T = any> extends PromiseLike<T> {
+  status?: 'pending' | 'fulfilled' | 'rejected';
+  value?: T;
+  reason?: any;
+}
+
+/**
+ * Sentinel thrown by `use(pendingThenable)`. Intentionally NOT an Error so
+ * userland try/catch is unlikely to swallow it — only our `tryBlock` knows
+ * to look for it via `isSuspenseException`. Carries the thenable so the
+ * boundary can attach a `then` listener and schedule a retry.
+ */
+class SuspenseException {
+  readonly __isSuspense = true;
+  constructor(public readonly thenable: TrackedThenable<any>) {}
+}
+
+export function isSuspenseException(x: any): x is SuspenseException {
+  return x !== null && typeof x === 'object' && (x as any).__isSuspense === true;
+}
+
+function useThenable<T>(thenable: TrackedThenable<T>): T {
+  const block = CURRENT_BLOCK!;
+  const state: TrackedThenable<any>[] = (block as any).__thenables ??= [];
+  const idx = (block as any).__thenableIdx as number;
+  (block as any).__thenableIdx = idx + 1;
+
+  const stored = state[idx];
+  // Replay path: same promise as last attempt — fast lookup of the cached entry.
+  if (stored === thenable) {
+    if (thenable.status === 'fulfilled') return thenable.value as T;
+    if (thenable.status === 'rejected') throw thenable.reason;
+    // Still pending — re-throw without re-tagging (already wired up).
+    throw new SuspenseException(thenable);
+  }
+
+  // New thenable at this slot — tag status if untracked, attach listeners.
+  state[idx] = thenable;
+  if (thenable.status === 'fulfilled') return thenable.value as T;
+  if (thenable.status === 'rejected') throw thenable.reason;
+  if (thenable.status !== 'pending') {
+    thenable.status = 'pending';
+    thenable.then(
+      (v) => { thenable.status = 'fulfilled'; thenable.value = v; },
+      (e) => { thenable.status = 'rejected'; thenable.reason = e; },
+    );
+  }
+  throw new SuspenseException(thenable);
 }
 
 // Monotonic counter — produces stable cross-render IDs.
@@ -930,11 +1037,25 @@ interface TrySlot {
   __kind: 'trySlotSlot';
   start: Comment;
   end: Comment;
-  branch: -1 | 0 | 1;   // -1 init, 0 catch, 1 try
+  // -1 init, 0 catch, 1 try (resolved), 2 pending
+  branch: -1 | 0 | 1 | 2;
   block: Block | null;
   tryBody: ComponentBody;
-  catchBody: ComponentBody;
+  catchBody: ComponentBody | null;
+  pendingBody: ComponentBody | null;
+  /**
+   * Solid <Loading>-style mode: once the try body has rendered successfully,
+   * subsequent suspends do NOT swap to the pending fallback — the prior DOM
+   * stays visible, and useTryPending() returns true inside the body for
+   * "stale data" styling. Caveat: a re-render attempt may mutate DOM partway
+   * before suspending, so place use() calls early.
+   */
+  keep: boolean;
+  /** Has the try body ever rendered to completion? Gates keep-mode behavior. */
+  hasResolved: boolean;
   err: any;
+  /** The thenable we're currently waiting on (so duplicate listeners don't fire). */
+  pendingThenable: TrackedThenable<any> | null;
   domParent: Node;
   parentBlock: Block;
 }
@@ -944,7 +1065,9 @@ export function tryBlock(
   slotKey: string,
   domParent: Node,
   tryBody: ComponentBody,
-  catchBody: ComponentBody,
+  catchBody: ComponentBody | null,
+  pendingBody: ComponentBody | null,
+  keep: boolean,
 ): void {
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as TrySlot | undefined;
@@ -953,22 +1076,43 @@ export function tryBlock(
     const end = document.createComment('/try');
     domParent.appendChild(start);
     domParent.appendChild(end);
-    state = {
+    const newState: TrySlot = {
       __kind: 'trySlotSlot', start, end, branch: -1, block: null,
-      tryBody, catchBody, err: null, domParent, parentBlock,
+      tryBody, catchBody, pendingBody, keep,
+      hasResolved: false,
+      err: null, pendingThenable: null,
+      domParent, parentBlock,
     };
-    parentScope[slotKey] = state;
+    parentScope[slotKey] = newState;
+    state = newState;
   } else {
     state.tryBody = tryBody;
     state.catchBody = catchBody;
+    state.pendingBody = pendingBody;
+    state.keep = keep;
   }
-  if (state.branch === 0) {
-    // Already showing catch — re-render with current err.
-    state.block!.body = state.catchBody;
-    state.block!.props = { err: state.err, reset: () => mountTry(state) };
-    renderBlock(state.block!);
+  const s = state;
+  if (s.branch === 0) {
+    // Already showing catch — re-render with current err (props identity unchanged).
+    s.block!.body = s.catchBody!;
+    s.block!.props = { err: s.err, reset: () => mountTry(s) };
+    renderBlock(s.block!);
+  } else if (s.branch === 2) {
+    // Already pending — no work; will be swapped when thenable resolves.
+  } else if (s.branch === 1 && s.block) {
+    // Already showing the resolved try body — re-render in place so we don't
+    // tear down its DOM (critical for keep mode, but also avoids mount churn
+    // in the default case). If the re-render suspends, handleSuspense decides
+    // whether to preserve the DOM (keep) or swap to pending (default).
+    s.block.body = s.tryBody;
+    try {
+      renderBlock(s.block);
+    } catch (err) {
+      if (isSuspenseException(err)) handleSuspense(s, err.thenable, s.block);
+      else switchToCatch(s, err);
+    }
   } else {
-    mountTry(state);
+    mountTry(s);
   }
 }
 
@@ -980,19 +1124,148 @@ function mountTry(state: TrySlot): void {
   state.domParent.insertBefore(bStart, state.end);
   state.domParent.insertBefore(bEnd, state.end);
   const b = createBlock('control-flow', state.parentBlock, state.domParent, bStart, bEnd, state.tryBody, undefined);
-  // Register error handler so descendant effect/render errors can find us.
+  (b as any).__trySlot = state;
+  // Register handlers so descendant effect/render errors can find us.
   (b as any).$$tryHandler = (err: any) => switchToCatch(state, err);
+  (b as any).__suspenseHandler = (thenable: TrackedThenable<any>, sourceBlock: Block) => {
+    handleSuspense(state, thenable, sourceBlock);
+  };
   state.block = b;
   try {
     renderBlock(b);
+    state.hasResolved = true;
   } catch (err) {
-    if (state.block) { unmountBlock(state.block); state.block = null; }
-    switchToCatch(state, err);
+    if (isSuspenseException(err)) {
+      // Initial render (or post-resolve re-mount) suspended. The block was just
+      // created in mountTry above — tear down its partial DOM and switch to
+      // pending. `hasResolved` stays false, so keep-mode won't kick in yet.
+      handleSuspense(state, err.thenable, b);
+    } else {
+      if (state.block) { unmountBlock(state.block); state.block = null; }
+      switchToCatch(state, err);
+    }
   }
+}
+
+function handleSuspense(
+  state: TrySlot,
+  thenable: TrackedThenable<any>,
+  sourceBlock: Block,
+): void {
+  const keepDom = state.keep && state.hasResolved && sourceBlock === state.block;
+
+  if (keepDom) {
+    // Solid <Loading>-style: do NOT tear down the prior DOM. The body may
+    // have partially mutated DOM before throwing at use() — those mutations
+    // stay visible. To get a clean "stale data + new query" handoff, users
+    // wrap the query in `useDeferredValue` so the suspending render is
+    // ALWAYS preceded by a sync re-render at the old query value.
+    attachResume(state, thenable, /* retryViaRender */ true);
+    return;
+  }
+
+  // Otherwise: unmount whatever's currently shown (partial try DOM, or a
+  // stale pending block) and mount the pending fallback.
+  if (state.block) { unmountBlock(state.block); state.block = null; }
+  state.branch = 2;
+  if (state.pendingBody) {
+    const bStart = document.createComment('pend-b');
+    const bEnd = document.createComment('/pend-b');
+    state.domParent.insertBefore(bStart, state.end);
+    state.domParent.insertBefore(bEnd, state.end);
+    const b = createBlock('control-flow', state.parentBlock, state.domParent, bStart, bEnd, state.pendingBody, undefined);
+    (b as any).__trySlot = state;
+    state.block = b;
+    try {
+      renderBlock(b);
+    } catch (err) {
+      // Pending body itself threw — bubble to catch.
+      if (state.block) { unmountBlock(state.block); state.block = null; }
+      switchToCatch(state, err);
+      return;
+    }
+  }
+  attachResume(state, thenable, /* retryViaRender */ false);
+}
+
+/**
+ * Wire up a `.then` listener that retries the try body when the thenable
+ * settles. Dedupes by `pendingThenable` so two suspends on the same promise
+ * don't queue two retries.
+ */
+function attachResume(
+  state: TrySlot,
+  thenable: TrackedThenable<any>,
+  retryViaRender: boolean,
+): void {
+  if (state.pendingThenable === thenable) return;
+  state.pendingThenable = thenable;
+  const retry = () => {
+    if (state.pendingThenable !== thenable) return;  // superseded
+    state.pendingThenable = null;
+    if (retryViaRender && state.block && !state.block.disposed) {
+      // Keep-mode retry: just re-render the existing try block in place.
+      try {
+        renderBlock(state.block);
+        state.hasResolved = true;
+      } catch (err) {
+        if (isSuspenseException(err)) handleSuspense(state, err.thenable, state.block!);
+        else switchToCatch(state, err);
+      }
+    } else {
+      // Non-keep / initial: remount the try body fresh.
+      mountTry(state);
+    }
+  };
+  thenable.then(retry, retry);
+}
+
+// ---------------------------------------------------------------------------
+// useDeferredValue — React 18 API. Returns the latest value normally, but on
+// the render where `value` changes, returns the previous value and schedules
+// a microtask-deferred commit + re-render. Combined with keep-mode tryBlock,
+// this gives the Solid <Loading> pattern: pass the suspending input through
+// useDeferredValue, compare `value !== deferred` to detect "stale data".
+// ---------------------------------------------------------------------------
+
+interface DeferredSlot<T> {
+  current: T;          // committed value (what we return)
+  next: T;             // latest pending value
+  scheduled: boolean;
+  block: Block;
+}
+
+export function useDeferredValue<T>(value: T, slot: symbol): T {
+  const scope = CURRENT_SCOPE!;
+  let s = scope.hooks.get(slot) as DeferredSlot<T> | undefined;
+  if (s === undefined) {
+    s = { current: value, next: value, scheduled: false, block: CURRENT_BLOCK! };
+    scope.hooks.set(slot, s);
+    return value;
+  }
+  s.next = value;
+  if (s.current === value) return s.current;
+  if (!s.scheduled) {
+    s.scheduled = true;
+    queueMicrotask(() => {
+      s!.scheduled = false;
+      if (s!.block.disposed || s!.current === s!.next) return;
+      s!.current = s!.next;
+      scheduleRender(s!.block);
+    });
+  }
+  return s.current;
 }
 
 function switchToCatch(state: TrySlot, err: any): void {
   if (state.block) { unmountBlock(state.block); state.block = null; }
+  // No catch arm — bubble to the next enclosing tryBlock (or surface).
+  if (state.catchBody === null) {
+    const parent = findTryHandler(state.parentBlock);
+    if (parent) parent(err);
+    else console.error('tryBlock with no catch arm received error:', err);
+    return;
+  }
   state.branch = 0;
   state.err = err;
   const bStart = document.createComment('catch-b');
@@ -1029,6 +1302,27 @@ export function findTryHandler(block: Block | null): ((err: any) => void) | null
     b = b.parentBlock;
   }
   return null;
+}
+
+/**
+ * Route an error thrown by `renderBlock` during scheduled re-renders.
+ * Suspense exceptions go to the nearest tryBlock's `__suspenseHandler`;
+ * everything else goes to `$$tryHandler`. Without a handler, we rethrow —
+ * which surfaces to the scheduler's caller (matches the prior behavior).
+ */
+function handleRenderError(block: Block, err: any): void {
+  if (isSuspenseException(err)) {
+    let b: Block | null = block;
+    while (b) {
+      const h = (b as any).__suspenseHandler;
+      if (h) { h(err.thenable, block); return; }
+      b = b.parentBlock;
+    }
+    throw err;
+  }
+  const h = findTryHandler(block);
+  if (h) h(err);
+  else throw err;
 }
 
 // ---------------------------------------------------------------------------
