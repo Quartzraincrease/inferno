@@ -72,19 +72,6 @@ export interface Block extends Scope {
   /** Cached key for this item Block. null on non-item blocks. */
   key: any;
   /**
-   * Closure-dep snapshot for impure for-of bodies. When the body is "impure"
-   * (closes over parent locals) but otherwise safe to skip (no hooks, no
-   * component calls, no control flow), the compiler emits a prologue that
-   * snapshots the parent locals + item into this array. On subsequent calls,
-   * if every captured value matches the snapshot, the body returns early —
-   * its DOM is already correct.
-   *
-   * null on first render (then promoted to an Array of the captured values)
-   * and on blocks whose body opted out of dep-memoing. Kept as a single
-   * field so the snapshot's length is implicit in the array's `.length`.
-   */
-  deps: any[] | null;
-  /**
    * Render priority for the next scheduled render: 'transition' (queued from
    * inside startTransition — suspending shouldn't swap to fallback if prior
    * UI is committed) or 'urgent' (default). Read & cleared when the render
@@ -387,7 +374,6 @@ export function createBlock(
     prevSibling: null,
     nextSibling: null,
     key: null,
-    deps: null,
     pendingMode: null,
     currentRenderMode: null,
     parent: null,
@@ -1831,6 +1817,13 @@ interface ForSlot {
   tail: Block | null;        // last item Block in DOM order
   size: number;              // count of item Blocks
   hasCleanups: boolean;      // true once any item registered a useEffect cleanup
+  // Last-render snapshot of the body's closed-over parent locals. The compiler
+  // emits a fresh `deps` array on every parent render for DEP-PURE for-of
+  // calls (impure body, no hooks/comps/control-flow). When this render's deps
+  // match last render's element-by-element, the runtime treats the body as
+  // PURE for the survivor short-circuit — saving the entire body call for
+  // every item whose ref + position are unchanged.
+  cachedDeps: any[] | null;
 }
 
 export function forBlock<T, E = undefined>(
@@ -1842,10 +1835,11 @@ export function forBlock<T, E = undefined>(
   itemBody: (scope: Scope, item: T, extra: E) => void,
   extra?: E,
   flags?: number,
+  deps?: any[],
 ): void {
   // flags bitfield: bit 0 = pure (auto-memo), bit 1 = singleRoot (skip per-item
-  // Comment markers because the body emits exactly one Element root). Packed
-  // into a single arg so the compiler emits one numeric literal instead of two.
+  // Comment markers), bit 2 = depEligible (compare `deps` to cachedDeps and
+  // promote body to PURE when unchanged). Packed into one numeric literal.
   const parentBlock = parentScope.block;
   let state = parentScope[slotKey] as ForSlot | undefined;
   if (state === undefined) {
@@ -1853,11 +1847,39 @@ export function forBlock<T, E = undefined>(
     const end = document.createComment('/for');
     domParent.appendChild(start);
     domParent.appendChild(end);
-    state = { __kind: 'forBlockSlot', start, end, items: new Map(), head: null, tail: null, size: 0, hasCleanups: false };
+    state = {
+      __kind: 'forBlockSlot',
+      start, end,
+      items: new Map(),
+      head: null, tail: null,
+      size: 0,
+      hasCleanups: false,
+      cachedDeps: null,
+    };
     parentScope[slotKey] = state;
   }
   const f = flags || 0;
-  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra, (f & 1) !== 0, (f & 2) !== 0);
+  let pure = (f & 1) !== 0;
+  // DEP-PURE upgrade: when the compiler marked this for-block as deps-eligible
+  // and last render's snapshot matches this render's, we can treat the body
+  // as PURE for the survivor short-circuit. The body still runs for moved/
+  // mounted/removed items — only stable survivors get skipped.
+  if ((f & 4) !== 0 && deps !== undefined) {
+    if (state.cachedDeps !== null && depsEqual(state.cachedDeps, deps)) {
+      pure = true;
+    }
+    state.cachedDeps = deps;
+  }
+  reconcileKeyed(parentBlock, state, items, getKey, itemBody as any, extra, pure, (f & 2) !== 0);
+}
+
+function depsEqual(a: any[], b: any[]): boolean {
+  const n = a.length;
+  if (n !== b.length) return false;
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /**

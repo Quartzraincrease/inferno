@@ -966,9 +966,12 @@ function planJsx(jsxNodesRaw, ctx, componentName, inlinedSubs, parentNs = 'html'
   const afterLines = [];
   for (const fc of forCalls) {
     ctx.runtimeNeeded.add('forBlock');
-    // flags: bit 0 = pure (auto-memo), bit 1 = singleRoot (skip per-item markers).
-    const flags = (fc.pure ? 1 : 0) | (fc.singleRoot ? 2 : 0);
-    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr}${flags ? ', ' + flags : ''});`);
+    // flags: bit 0 = pure (auto-memo), bit 1 = singleRoot (skip per-item markers),
+    //        bit 2 = depEligible (runtime compares deps array, upgrades to pure
+    //        for survivors when deps unchanged this render).
+    const flags = (fc.pure ? 1 : 0) | (fc.singleRoot ? 2 : 0) | (fc.depEligible ? 4 : 0);
+    const depsArg = fc.depEligible ? `, [${fc.depNames.join(', ')}]` : '';
+    afterLines.push(`  forBlock(__s, ${JSON.stringify('_for$' + fc.id)}, __s.${bindingsName}._for$${fc.id}, ${fc.itemsExpr}, ${fc.keyHelper}, ${fc.bodyHelper}, ${fc.extraExpr}${flags ? ', ' + flags : ''}${depsArg});`);
   }
   for (const ic of ifCalls) {
     ctx.runtimeNeeded.add('ifBlock');
@@ -1785,24 +1788,21 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     }],
   }] : [];
 
-  // ─── Body analysis: pure / dep-memo / single-root.
+  // ─── Body analysis: PURE vs DEP-PURE vs normal.
   //
-  // Three escalating fast paths the runtime can take per row:
-  //   1. PURE: body closes over nothing parent-reactive, no hooks, no comps,
-  //      no control flow → reconciler skips renderBlock when item ref + index
-  //      unchanged. Identified by `pure = true`.
-  //   2. DEP-MEMO: body DOES close over parent locals but otherwise as clean
-  //      as PURE (no hooks, no comps, no control flow). Body itself runs but
-  //      short-circuits via a `__block.deps` snapshot check at the prologue.
-  //      Identified by `depNames.length > 0` AND `depMemoEligible`.
-  //   3. NORMAL: anything else → body runs every render, per-binding diffs do
-  //      the change detection.
-  // The analysis must run BEFORE compileFunctionBody (we pass the prologue
-  // in), but uses only AST inspection — no compiler side effects to worry
-  // about ordering against.
+  // - PURE: body closes over nothing parent-reactive, no hooks, no comps,
+  //   no control flow. Reconciler skips renderBlock when item ref + index
+  //   unchanged. Identified by `pure = true`.
+  // - DEP-PURE: body DOES close over parent locals but is otherwise as
+  //   clean as PURE. The compiler emits an explicit deps array at the
+  //   forBlock call site so the reconciler can do ONE deps-equality check
+  //   per parent render and, if unchanged, treat the body as PURE for the
+  //   survivor short-circuit. Saves the body call entirely for
+  //   item-ref-and-index-stable survivors — no per-row snapshot work.
+  // - NORMAL: anything else → body runs every render.
   let pure = false;
   const depNames = [];
-  let depMemoEligible = false;
+  let depEligible = false;
   if (ctx.currentComponentLocals) {
     const bodyScope = new Set([itemName]);
     if (node.index) bodyScope.add(node.index.name);
@@ -1819,47 +1819,9 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
       }
     }
     const hasNestedComp = containsComponentCallOrControlFlow(subStmts);
-    // PURE: nothing from parent, no hooks, no comps/control-flow.
     pure = !hasParentClosure && !hasHook && !hasNestedComp;
-    // DEP-MEMO: parent closures present, but the same hook/comp/control-flow
-    // exclusions as PURE. We pre-evaluate each dep at the top of the body
-    // and skip the rest of the body if all match the previous snapshot.
-    depMemoEligible = !pure && hasParentClosure && !hasHook && !hasNestedComp;
-    // Deterministic order so emitted code is stable across compiles.
+    depEligible = !pure && hasParentClosure && !hasHook && !hasNestedComp;
     depNames.sort();
-  }
-
-  // The item body is INLINED inside the parent component body so it captures
-  // any locals it references (e.g. `state.selected`, the parent's hook setters).
-  // This trades a per-render closure alloc for the per-render flexibility.
-  //
-  // For DEP-MEMO bodies, the prologue (raw JS) is prepended inside the item
-  // function: snapshot the closure deps + item + itemIndex into `__block.deps`
-  // and short-circuit on identity match. The reconciler still calls render
-  // for impure bodies — the savings come from the body returning before any
-  // binding-update or DOM work runs.
-  let prologue = '';
-  if (depMemoEligible) {
-    // Slot order: [parent-local closures..., item ref, itemIndex].
-    // itemIndex is included unconditionally so position changes (e.g. middle
-    // reorders) re-render even when item ref + closures are unchanged —
-    // matches the existing pure-memo check.
-    const slots = depNames.map(n => `(${n})`);
-    slots.push(`(${itemName})`);
-    slots.push('__block.itemIndex');
-    const declParts = slots.map((e, i) => `_d${i} = ${e}`).join(', ');
-    const checks = slots.map((_, i) => `_ds[${i}] === _d${i}`).join(' && ');
-    const writes = slots.map((_, i) => `_ds[${i}] = _d${i};`).join(' ');
-    const initArr = slots.map((_, i) => `_d${i}`).join(', ');
-    prologue =
-`  const ${declParts};
-  const _ds = __block.deps;
-  if (_ds !== null) {
-    if (${checks}) return;
-    ${writes}
-  } else {
-    __block.deps = [${initArr}];
-  }`;
   }
 
   const itemHelperName = `__item$${ctx.nextHelperId++}`;
@@ -1869,7 +1831,7 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     params: [{ type: 'Identifier', name: itemName }],
     body: [...indexInjection, ...destructureInjection, ...subStmts],
   };
-  const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash, { prologue });
+  const itemFnSource = compileFunctionBody(fakeComponent, ctx, itemHelperName, parentNs, cssHash);
   inlinedSubs.push(itemFnSource + ';');
 
   // Single-root detection: when the body emits exactly one Element root and
@@ -1895,6 +1857,11 @@ function makeForCall(node, ctx, componentName, inlinedSubs, parentNs = 'html', c
     extraExpr: 'undefined',
     pure,
     singleRoot,
+    // DEP-PURE candidates emit `[dep0, dep1, ...]` as the deps arg in the
+    // forBlock call. Reconciler compares to its cached deps; if unchanged
+    // this render, treats the body as PURE for the survivor short-circuit.
+    depEligible,
+    depNames,
     hostPath: null,
   };
 }
