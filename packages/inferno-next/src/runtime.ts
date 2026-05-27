@@ -23,7 +23,15 @@ export type Cleanup = () => void;
 export interface Scope {
   block: Block;
   parent: Scope | null;
-  hooks: Map<symbol, any>;
+  /**
+   * Hook slot map. Lazily allocated on the first hook call via `ensureHooks`.
+   * For-of item bodies that never call a hook (the common case in
+   * js-framework-benchmark-shaped lists) keep this as `null` for their
+   * lifetime — saving the Map allocation per Block on mass-mount paths.
+   * Reads use optional chaining (`scope.hooks?.get(slot)`) which returns
+   * `undefined` when null, identical to a Map.get miss.
+   */
+  hooks: Map<symbol, any> | null;
   cleanups: Cleanup[];
   /**
    * Per-call-site child scopes, stored as `[key, scope]` pairs in a flat array
@@ -40,6 +48,16 @@ export interface Scope {
 interface ChildScope {
   key: symbol;
   scope: Scope;
+}
+
+/**
+ * Lazy allocator for the per-scope hook map. Returns the existing Map or
+ * creates one on first use. Hook write sites should call this; hook read
+ * sites use `scope.hooks?.get(slot)` directly (undefined return matches a
+ * Map-miss).
+ */
+function ensureHooks(scope: Scope): Map<symbol, any> {
+  return scope.hooks ?? (scope.hooks = new Map());
 }
 
 export type BlockKind = 'root' | 'control-flow' | 'dynamic' | 'portal';
@@ -283,7 +301,7 @@ function drainPhase(phase: Phase): void {
   for (let i = 0; i < q.length; i++) {
     const e = q[i];
     if (e.scope.block.disposed) continue;
-    const slot = e.scope.hooks.get(e.slot) as EffectSlot | undefined;
+    const slot = e.scope.hooks?.get(e.slot) as EffectSlot | undefined;
     if (slot && slot.cleanup) {
       try { slot.cleanup(); } catch (err) { console.error(err); }
       slot.cleanup = undefined;
@@ -302,7 +320,7 @@ function drainPhase(phase: Phase): void {
       else console.error(err);
       continue;
     }
-    const slot = e.scope.hooks.get(e.slot) as EffectSlot | undefined;
+    const slot = e.scope.hooks?.get(e.slot) as EffectSlot | undefined;
     if (slot && typeof cleanup === 'function') {
       slot.cleanup = cleanup;
       e.scope.cleanups.push(cleanup);
@@ -340,6 +358,88 @@ function schedulePostPaint(cb: () => void): void {
 // Block + Scope creation
 // ---------------------------------------------------------------------------
 
+/**
+ * Block class — concrete shape backing the `Block` interface. Allocated via
+ * `new` so V8 derives the hidden class from this single constructor, instead
+ * of synthesising it from an object-literal site (which V8 can also do but
+ * with a less predictable optimisation profile when the literal has many
+ * fields). Compiled bodies still stamp dynamic `b$N` / `_for$N` props on the
+ * instance — V8 transitions all blocks through the same transition tree.
+ *
+ * All fields initialised in a single, fixed order. Item-only fields
+ * (prev/next sibling, key, itemIndex) sit on every Block as null/0 so root
+ * and dynamic blocks share the same shape with for-of item blocks.
+ */
+class BlockImpl {
+  // Hot fields first (touched by every renderBlock / reconcile iteration).
+  body: ComponentBody;
+  props: any;
+  extra: any;
+  parentNode: Node;
+  parentBlock: Block | null;
+  startMarker: Node | null;
+  endMarker: Node | null;
+  itemIndex: number;
+  // Scheduler / lifecycle.
+  pending: boolean;
+  disposed: boolean;
+  mounted: boolean;
+  pendingMode: 'urgent' | 'transition' | null;
+  currentRenderMode: 'urgent' | 'transition' | null;
+  // Hooks + cleanups (per-block state).
+  hooks: Map<symbol, any> | null;
+  cleanups: Cleanup[];
+  children: ChildScope[];
+  // For-block item bookkeeping.
+  forSlot: ForSlot | null;
+  prevSibling: Block | null;
+  nextSibling: Block | null;
+  key: any;
+  // Scope contract: a Block is its own scope.
+  parent: Scope | null;
+  block: Block;
+  // Metadata.
+  kind: BlockKind;
+  // Dynamic bindings (b$N, _for$N, etc.) are stamped on the instance by
+  // compiled bodies. V8 sees them as transitions on the shared shape.
+  [key: string]: any;
+
+  constructor(
+    kind: BlockKind,
+    parentBlock: Block | null,
+    parentNode: Node,
+    startMarker: Node | null,
+    endMarker: Node | null,
+    body: ComponentBody,
+    props: any,
+    extra: any,
+  ) {
+    this.body = body;
+    this.props = props;
+    this.extra = extra;
+    this.parentNode = parentNode;
+    this.parentBlock = parentBlock;
+    this.startMarker = startMarker;
+    this.endMarker = endMarker;
+    this.itemIndex = 0;
+    this.pending = false;
+    this.disposed = false;
+    this.mounted = false;
+    this.pendingMode = null;
+    this.currentRenderMode = null;
+    this.hooks = null;
+    this.cleanups = [];
+    this.children = [];
+    this.forSlot = null;
+    this.prevSibling = null;
+    this.nextSibling = null;
+    this.key = null;
+    this.parent = null;
+    this.block = this as unknown as Block;
+    this.kind = kind;
+  }
+}
+
 export function createBlock(
   kind: BlockKind,
   parentBlock: Block | null,
@@ -350,38 +450,9 @@ export function createBlock(
   props: any,
   extra?: any,
 ): Block {
-  // All fields initialized in a fixed order so every Block transitions
-  // through the same V8 hidden-class chain. Item-specific fields (prev/next
-  // sibling, key, itemIndex) sit on every Block as null/0 — paying a few
-  // bytes per non-item block to keep the shape monomorphic in hot paths.
-  const block: Block = {
-    kind,
-    parentBlock,
-    parentNode,
-    startMarker,
-    endMarker,
-    body,
-    props,
-    extra,
-    hooks: new Map(),
-    cleanups: [],
-    children: [],
-    mounted: false,
-    pending: false,
-    disposed: false,
-    forSlot: null,
-    itemIndex: 0,
-    prevSibling: null,
-    nextSibling: null,
-    key: null,
-    pendingMode: null,
-    currentRenderMode: null,
-    parent: null,
-    // `block: self` makes a Block satisfy the Scope contract.
-    block: null as any,
-  };
-  block.block = block;
-  return block;
+  return new BlockImpl(
+    kind, parentBlock, parentNode, startMarker, endMarker, body, props, extra,
+  ) as unknown as Block;
 }
 
 export function renderBlock(block: Block): void {
@@ -429,7 +500,7 @@ export function withScope<P>(
     scope = {
       block: parent.block,
       parent,
-      hooks: new Map(),
+      hooks: null,
       cleanups: [],
       children: [],
       mounted: false,
@@ -524,7 +595,7 @@ export function useState<T>(
 ): [T, (next: T | ((prev: T) => T)) => void] {
   const scope = CURRENT_SCOPE!;
   const block = CURRENT_BLOCK!;
-  let s = scope.hooks.get(slot) as StateSlot<T> | undefined;
+  let s = scope.hooks?.get(slot) as StateSlot<T> | undefined;
   if (s === undefined) {
     const initVal = typeof initial === 'function' ? (initial as () => T)() : initial;
     s = {
@@ -538,7 +609,7 @@ export function useState<T>(
         scheduleRender(block);
       },
     };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
   }
   return [s.value, s.setter];
 }
@@ -550,7 +621,7 @@ export function useReducer<S, A>(
 ): [S, (action: A) => void] {
   const scope = CURRENT_SCOPE!;
   const block = CURRENT_BLOCK!;
-  let s = scope.hooks.get(slot) as { value: S; dispatch: (a: A) => void; reducer: (s: S, a: A) => S } | undefined;
+  let s = scope.hooks?.get(slot) as { value: S; dispatch: (a: A) => void; reducer: (s: S, a: A) => S } | undefined;
   if (s === undefined) {
     const initVal = typeof initial === 'function' ? (initial as () => S)() : initial;
     s = {
@@ -563,7 +634,7 @@ export function useReducer<S, A>(
         scheduleRender(block);
       },
     };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
   } else {
     // Allow reducer reference to update across renders.
     s.reducer = reducer;
@@ -582,10 +653,10 @@ function depsChanged(prev: any[] | undefined, next: any[] | undefined): boolean 
 
 function enqueueEffect(slot: symbol, fn: EffectFn, deps: any[], phase: Phase): void {
   const scope = CURRENT_SCOPE!;
-  const prev = scope.hooks.get(slot) as EffectSlot | undefined;
+  const prev = scope.hooks?.get(slot) as EffectSlot | undefined;
   if (prev && !depsChanged(prev.deps, deps)) return;
   if (!prev) {
-    scope.hooks.set(slot, { deps, cleanup: undefined });
+    ensureHooks(scope).set(slot, { deps, cleanup: undefined });
     // Mark any enclosing for-block items so batch-clear knows to walk cleanups.
     let b: Block | null = scope.block;
     while (b) {
@@ -610,11 +681,11 @@ export function useInsertionEffect(fn: EffectFn, deps: any[], slot: symbol): voi
 
 export function useMemo<T>(compute: (...deps: any[]) => T, deps: any[], slot: symbol): T {
   const scope = CURRENT_SCOPE!;
-  const prev = scope.hooks.get(slot) as { deps: any[]; value: T } | undefined;
+  const prev = scope.hooks?.get(slot) as { deps: any[]; value: T } | undefined;
   if (prev && !depsChanged(prev.deps, deps)) return prev.value;
   // eslint-disable-next-line prefer-spread
   const value = compute.apply(null, deps);
-  scope.hooks.set(slot, { deps, value });
+  ensureHooks(scope).set(slot, { deps, value });
   return value;
 }
 
@@ -624,10 +695,10 @@ export function useCallback<F extends (...args: any[]) => any>(fn: F, deps: any[
 
 export function useRef<T>(initial: T, slot: symbol): { current: T } {
   const scope = CURRENT_SCOPE!;
-  let s = scope.hooks.get(slot) as { current: T } | undefined;
+  let s = scope.hooks?.get(slot) as { current: T } | undefined;
   if (s === undefined) {
     s = { current: initial };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
   }
   return s;
 }
@@ -663,11 +734,11 @@ export function useImperativeHandle<T>(
  */
 export function useEffectEvent<F extends (...args: any[]) => any>(fn: F, slot: symbol): F {
   const scope = CURRENT_SCOPE!;
-  let s = scope.hooks.get(slot) as { current: F; stable: F } | undefined;
+  let s = scope.hooks?.get(slot) as { current: F; stable: F } | undefined;
   if (s === undefined) {
     const stable = ((...args: any[]) => s!.current.apply(null, args)) as F;
     s = { current: fn, stable };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
   } else {
     s.current = fn;
   }
@@ -805,10 +876,10 @@ function useThenable<T>(thenable: TrackedThenable<T>): T {
 let _idCounter = 0;
 export function useId(slot: symbol): string {
   const scope = CURRENT_SCOPE!;
-  let s = scope.hooks.get(slot) as { id: string } | undefined;
+  let s = scope.hooks?.get(slot) as { id: string } | undefined;
   if (s === undefined) {
     s = { id: ':in-' + (_idCounter++).toString(36) + ':' };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
   }
   return s.id;
 }
@@ -1595,11 +1666,11 @@ export function startTransition(fn: () => void): void {
 export function useTransition(slot: symbol): [boolean, (fn: () => void) => void] {
   const scope = CURRENT_SCOPE!;
   const block = CURRENT_BLOCK!;
-  let s = scope.hooks.get(slot) as { isPending: boolean; start: (fn: () => void) => void } | undefined;
+  let s = scope.hooks?.get(slot) as { isPending: boolean; start: (fn: () => void) => void } | undefined;
   if (s === undefined) {
     const slotRef = { isPending: false, start: startTransition };
     s = slotRef;
-    scope.hooks.set(slot, slotRef);
+    ensureHooks(scope).set(slot, slotRef);
     const listener = () => {
       const next = TRANSITION_PENDING_COUNT > 0;
       if (slotRef.isPending !== next) {
@@ -1631,10 +1702,10 @@ interface DeferredSlot<T> {
 export function useDeferredValue<T>(value: T, slot: symbol): T {
   const scope = CURRENT_SCOPE!;
   const block = CURRENT_BLOCK!;
-  let s = scope.hooks.get(slot) as DeferredSlot<T> | undefined;
+  let s = scope.hooks?.get(slot) as DeferredSlot<T> | undefined;
   if (s === undefined) {
     s = { current: value, next: value, scheduled: false, block };
-    scope.hooks.set(slot, s);
+    ensureHooks(scope).set(slot, s);
     return value;
   }
   s.next = value;
